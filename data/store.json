@@ -1,0 +1,182 @@
+{
+  "settings": {
+    "companyId": "horyeoul7",
+    "companyPassword": "7777",
+    "adminPassword": "admin7777"
+  },
+  "workers": [
+    {
+      "id": "w-1",
+      "name": "김철수",
+      "role": "시설과장",
+      "createdAt": "2026-11-18T10:35:15.210Z",
+      "apartmentId": "apt-horyeoul7"
+    },
+    {
+      "id": "w-2",
+      "name": "이영희",
+      "role": "관리주임",
+      "createdAt": "2026-11-18T10:35:15.210Z",
+      "apartmentId": "apt-horyeoul7"
+    },
+    {
+      "id": "w-3",
+      "name": "박민수",
+      "role": "전기기사",
+      "createdAt": "2026-11-18T10:35:15.210Z",
+      "apartmentId": "apt-horyeoul7"
+    },
+    {
+      "id": "w-4",
+      "name": "정수진",
+      "role": "서무주임",
+      "createdAt": "2026-11-18T10:35:15.210Z",
+      "apartmentId": "apt-horyeoul7"
+    }
+  ],
+  "logs": [
+    {
+      "id": "log-seed-1",
+      "workerId": "w-1",
+      "workerName": "김철수",
+      "workerRole": "시설과장",
+      "workDate": "2026-11-18",
+      "location": "701동 지하1층 주차장",
+      "content": "지하1층 B구역 천장 LED 센서등 점등 불량 2개소 안정기 및 등기구 신품 교체 완료",
+      "photoUrl": "/src/assets/images/apt_led_lighting_1794997917687.jpg",
+      "createdAt": "2026-11-18T08:35:15.210Z",
+      "updatedAt": "2026-11-18T08:35:15.210Z",
+      "apartmentId": "apt-horyeoul7",
+      "status": "completed"
+    },
+    {
+      "id": "log-seed-2",
+      "workerId": "w-2",
+      "workerName": "이영희",
+      "workerRole": "관리주임",
+      "workDate": "2026-11-18",
+      "location": "704동~705동 중앙 보행로",
+      "content": "중앙 보행로 우수 배수로 트렌치 내 낙엽 및 토사 제거 청소, 주변 관목 전정 정비",
+      "photoUrl": "/src/assets/images/apt_garden_drain_1794997918597.jpg",
+      "createdAt": "2026-11-18T06:35:15.210Z",
+      "updatedAt": "2026-11-18T06:35:15.210Z",
+      "apartmentId": "apt-horyeoul7",
+      "status": "in_progress"
+    },
+    {
+      "id": "log-seed-3",
+      "workerId": "w-3",
+      "workerName": "박민수",
+      "workerRole": "전기기사",
+      "workDate": "2026-11-17",
+      "location": "단지 내 어린이놀이터",
+      "content": "놀이터 조합놀이대 볼트 체결 상태 및 탄성포장재 파손 여부 일제 안전 점검 완료",
+      "photoUrl": "/src/assets/images/apt_playground_check_1794997919697.jpg",
+      "createdAt": "2026-11-17T08:35:15.210Z",
+      "updatedAt": "2026-11-17T08:35:15.210Z",
+      "apartmentId": "apt-horyeoul7",
+      "status": "pending"
+    }
+  ],
+  "sessions": {
+    "b5bced604355d029a9baa5a35069b3d4b68f35c42f3b8406": {
+      "token": "b5bced604355d029a9baa5a35069b3d4b68f35c42f3b8406",
+      "isAdmin": false,
+      "createdAt": "2026-11-18T10:35:25.210Z",
+      "lastSeenAt": "2026-11-18T10:35:25.210Z",
+      "apartmentId": "apt-horyeoul7"
+    },
+    "f1d0454f6803eddfbfe2e9e6342ffc8ee283b1441d52d3a9": {
+      "token": "f1d0454f6803eddfbfe2e9e6342ffc8ee283b1441d52d3a9",
+      "isAdmin": false,
+      "createdAt": "2026-11-18T10:45:02.047Z",
+      "lastSeenAt": "2026-11-18T10:45:02.047Z",
+      "apartmentId": "apt-horyeoul7"
+    },
+    "253ea6134a995b6a7d7ffd572d9bf98f4767f07e2467d95c": {
+      "token": "253ea6134a995b6a7d7ffd572d9bf98f4767f07e2467d95c",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": false,
+      "createdAt": "2026-11-18T11:35:12.277Z",
+      "lastSeenAt": "2026-11-18T11:35:12.277Z"
+    },
+    "9703c87dde06bad382ee12688286ef06e2c2b6a829c2ad0c": {
+      "token": "9703c87dde06bad382ee12688286ef06e2c2b6a829c2ad0c",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": false,
+      "createdAt": "2026-11-18T11:35:18.605Z",
+      "lastSeenAt": "2026-11-18T11:35:18.605Z"
+    },
+    "b59e68979a5f52922383a771eff980d412b2a15cc64223fb": {
+      "token": "b59e68979a5f52922383a771eff980d412b2a15cc64223fb",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": true,
+      "createdAt": "2026-11-18T11:51:05.983Z",
+      "lastSeenAt": "2026-11-18T11:51:06.003Z"
+    }
+  },
+  "notices": [
+    {
+      "id": "notice-seed-1",
+      "title": "동절기 지하주차장 배관 및 옥외 수도 동파 예방 순찰 강화",
+      "content": "야간 기온 하강에 따라 지하주차장 램프 입구 및 옥외 공용 수전 보온재 상태를 주야간 교대 시 1회 이상 점검하여 이상 발견 시 즉시 작업일지에 기록 바랍니다.",
+      "isPinned": true,
+      "authorName": "김철수",
+      "createdAt": "2026-11-18T10:45:02.046Z",
+      "updatedAt": "2026-11-18T10:45:02.046Z",
+      "apartmentId": "apt-horyeoul7"
+    },
+    {
+      "id": "notice-seed-2",
+      "title": "11월 승강기 정기 안전점검 일정 안내 (701~706동)",
+      "content": "금주 목요일 09:30~16:00 전 동 승강기 월간 점검이 진행됩니다. 점검 업체 도착 시 기계실 열쇠 불출 및 동행 안내 협조 부탁드립니다.",
+      "isPinned": false,
+      "authorName": "이영희",
+      "createdAt": "2026-11-17T16:45:02.046Z",
+      "updatedAt": "2026-11-17T16:45:02.046Z",
+      "apartmentId": "apt-horyeoul7"
+    }
+  ],
+  "handovers": [
+    {
+      "id": "handover-seed-1",
+      "workerId": "w-3",
+      "workerName": "박민수",
+      "workerRole": "전기기사",
+      "targetShift": "주간/익일",
+      "content": "702동 3라인 승강기 비상통화장치 간헐적 잡음 민원 접수됨. 내일 오전 09:30 점검 기사 방문 예정이니 1차 확인 부탁드립니다.",
+      "status": "pending",
+      "completedBy": null,
+      "completedAt": null,
+      "createdAt": "2026-11-18T07:45:02.046Z",
+      "updatedAt": "2026-11-18T07:45:02.046Z",
+      "apartmentId": "apt-horyeoul7"
+    },
+    {
+      "id": "handover-seed-2",
+      "workerId": "w-1",
+      "workerName": "김철수",
+      "workerRole": "시설과장",
+      "targetShift": "야간/당직",
+      "content": "정문 차단기 비상용 리모컨 2개 건전지 교체 완료. 여분 배터리는 관리사무소 당직 책상 좌측 서랍에 보관했습니다.",
+      "status": "completed",
+      "completedBy": "이영희",
+      "completedAt": "2026-11-17T20:45:02.046Z",
+      "createdAt": "2026-11-17T20:45:02.046Z",
+      "updatedAt": "2026-11-17T20:45:02.046Z",
+      "apartmentId": "apt-horyeoul7"
+    }
+  ],
+  "apartments": [
+    {
+      "id": "apt-horyeoul7",
+      "name": "호려울마을 7단지",
+      "officeName": "호려울마을 7단지 관리사무소",
+      "companyId": "horyeoul7",
+      "companyPassword": "7777",
+      "adminPassword": "admin7777",
+      "createdAt": "2026-11-18T10:58:45.979Z"
+    }
+  ],
+  "banners": []
+}
