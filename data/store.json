@@ -113,6 +113,20 @@
       "isAdmin": true,
       "createdAt": "2026-11-18T11:51:05.983Z",
       "lastSeenAt": "2026-11-18T11:51:06.003Z"
+    },
+    "5d0c3a80c702d9aa98046be2fbbb00a4a3fd2f57fb877752": {
+      "token": "5d0c3a80c702d9aa98046be2fbbb00a4a3fd2f57fb877752",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": false,
+      "createdAt": "2026-11-18T12:20:19.056Z",
+      "lastSeenAt": "2026-11-18T12:20:19.056Z"
+    },
+    "4a872e90b482e3c252c93cc6ef4c2d44fe3bc13b62766006": {
+      "token": "4a872e90b482e3c252c93cc6ef4c2d44fe3bc13b62766006",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": true,
+      "createdAt": "2026-11-18T12:28:02.004Z",
+      "lastSeenAt": "2026-11-18T12:28:02.017Z"
     }
   },
   "notices": [
@@ -178,5 +192,22 @@
       "createdAt": "2026-11-18T10:58:45.979Z"
     }
   ],
-  "banners": []
+  "banners": [],
+  "externalAds": {
+    "apt-horyeoul7": {
+      "apartmentId": "apt-horyeoul7",
+      "mode": "inquiry",
+      "sponsorName": "지역 상가 · 파트너 광고 영역",
+      "headline": "이 자리에 외부 광고 및 제휴 배너를 게재할 수 있습니다",
+      "description": "단지 인근 상가·협력업체 배너, Google AdSense, 카카오 애드핏 연동을 지원합니다.",
+      "imageUrl": "",
+      "linkUrl": "",
+      "ctaLabel": "자세히 보기",
+      "contactInfo": "관리자 메뉴 > 하단 외부 광고 설정에서 변경 가능",
+      "adsenseClientId": "",
+      "adsenseSlotId": "",
+      "adfitUnitId": "",
+      "updatedAt": "2026-11-18T12:28:02.026Z"
+    }
+  }
 }

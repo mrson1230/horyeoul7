@@ -18,9 +18,17 @@ import {
   getStoredToken,
   getTodayKoreaDate,
 } from '../utils/api';
+import { AdSlotManagerSection } from './AdSlotManagerSection';
 import { BannerMakerSection } from './BannerMakerSection';
 import { WorkStatusLabel } from './WorkStatusLabel';
-import type { Apartment, EventBanner, Worker, WorkLog, WorkStatus } from '../types';
+import type {
+  Apartment,
+  EventBanner,
+  ExternalAdConfig,
+  Worker,
+  WorkLog,
+  WorkStatus,
+} from '../types';
 
 interface AdminPanelProps {
   isAdmin: boolean;
@@ -29,6 +37,7 @@ interface AdminPanelProps {
   workers: Worker[];
   logs: WorkLog[];
   banners: EventBanner[];
+  adSlot: ExternalAdConfig;
   filterWorkerId: string;
   filterDate: string;
   filterStatus: 'all' | WorkStatus;
@@ -37,6 +46,7 @@ interface AdminPanelProps {
   onApartmentUpdated: (apt: Apartment) => void;
   onWorkersChanged: () => void;
   onBannersChanged: (next: EventBanner[]) => void;
+  onAdSlotChanged: (next: ExternalAdConfig) => void;
   onEditLog: (log: WorkLog) => void;
   onLogDeleted: (id: string) => void;
 }
@@ -48,6 +58,7 @@ export function AdminPanel({
   workers,
   logs,
   banners,
+  adSlot,
   filterWorkerId,
   filterDate,
   filterStatus,
@@ -56,6 +67,7 @@ export function AdminPanel({
   onApartmentUpdated,
   onWorkersChanged,
   onBannersChanged,
+  onAdSlotChanged,
   onEditLog,
   onLogDeleted,
 }: AdminPanelProps) {
@@ -595,6 +607,12 @@ export function AdminPanel({
         officeName={officeName}
         banners={banners}
         onBannersChanged={onBannersChanged}
+      />
+
+      {/* Bottom External Ad Slot Configuration */}
+      <AdSlotManagerSection
+        adSlot={adSlot}
+        onAdSlotChanged={onAdSlotChanged}
       />
 
       {/* Apartment Management & New Apartment Registration */}

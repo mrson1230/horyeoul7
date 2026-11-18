@@ -10,6 +10,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { AdminPanel } from './components/AdminPanel';
+import { BottomAdSlot } from './components/BottomAdSlot';
 import { EditLogModal } from './components/EditLogModal';
 import { EventBannerCard } from './components/EventBannerCard';
 import { LoginView } from './components/LoginView';
@@ -25,6 +26,7 @@ import {
 } from './utils/api';
 import type {
   EventBanner,
+  ExternalAdConfig,
   Handover,
   Notice,
   SessionInfo,
@@ -32,6 +34,23 @@ import type {
   WorkLog,
   WorkStatus,
 } from './types';
+
+const DEFAULT_AD_SLOT: ExternalAdConfig = {
+  apartmentId: 'apt-horyeoul7',
+  mode: 'inquiry',
+  sponsorName: '지역 상가 · 파트너 광고 영역',
+  headline: '이 자리에 외부 광고 및 제휴 배너를 게재할 수 있습니다',
+  description:
+    '단지 인근 상가·협력업체 배너, Google AdSense, 카카오 애드핏 연동을 지원합니다.',
+  imageUrl: '',
+  linkUrl: '',
+  ctaLabel: '자세히 보기',
+  contactInfo: '관리자 메뉴 > 하단 외부 광고 설정에서 변경 가능',
+  adsenseClientId: '',
+  adsenseSlotId: '',
+  adfitUnitId: '',
+  updatedAt: '',
+};
 
 const HERO_APARTMENT_IMAGE =
   '/src/assets/images/apartment_complex_hero_1794999359810.jpg';
@@ -59,6 +78,7 @@ export default function App() {
   const [notices, setNotices] = useState<Notice[]>([]);
   const [handovers, setHandovers] = useState<Handover[]>([]);
   const [banners, setBanners] = useState<EventBanner[]>([]);
+  const [adSlot, setAdSlot] = useState<ExternalAdConfig>(DEFAULT_AD_SLOT);
 
   const [filterWorkerId, setFilterWorkerId] = useState('all');
   const [filterDate, setFilterDate] = useState('');
@@ -145,14 +165,18 @@ export default function App() {
   const fetchNoticesAndHandovers = useCallback(async () => {
     if (!session?.authenticated) return;
     try {
-      const [noticeRes, handoverRes, bannerRes] = await Promise.all([
+      const [noticeRes, handoverRes, bannerRes, adSlotRes] = await Promise.all([
         apiFetch<{ notices: Notice[] }>('/api/notices'),
         apiFetch<{ handovers: Handover[] }>('/api/handovers'),
         apiFetch<{ banners: EventBanner[] }>('/api/banners'),
+        apiFetch<{ adSlot: ExternalAdConfig }>('/api/ad-slot'),
       ]);
       setNotices(noticeRes.notices);
       setHandovers(handoverRes.handovers);
       setBanners(bannerRes.banners);
+      if (adSlotRes.adSlot) {
+        setAdSlot(adSlotRes.adSlot);
+      }
     } catch {
       // Handled gracefully
     }
@@ -186,6 +210,7 @@ export default function App() {
     setSelectedWorkerId('');
     setStoredWorkerId('');
     setBanners([]);
+    setAdSlot(DEFAULT_AD_SLOT);
     setSession((prev) => ({
       authenticated: false,
       isAdmin: false,
@@ -567,6 +592,7 @@ export default function App() {
             workers={workers}
             logs={logs}
             banners={banners}
+            adSlot={adSlot}
             filterWorkerId={filterWorkerId}
             filterDate={filterDate}
             filterStatus={filterStatus}
@@ -587,6 +613,7 @@ export default function App() {
             }
             onWorkersChanged={() => void fetchWorkers()}
             onBannersChanged={setBanners}
+            onAdSlotChanged={setAdSlot}
             onEditLog={setEditingLog}
             onLogDeleted={(id) =>
               setLogs((prev) => prev.filter((item) => item.id !== id))
@@ -594,6 +621,16 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* Bottom External Advertisement Area */}
+      {adSlot.mode !== 'hidden' && (
+        <footer className="relative z-10 w-full max-w-7xl mx-auto px-4 sm:px-6 mt-8 pt-4">
+          <BottomAdSlot
+            adSlot={adSlot}
+            onOpenAdmin={() => switchTab('admin')}
+          />
+        </footer>
+      )}
 
       {/* Mobile Fixed Bottom Thumb-Zone Navigation (5 tabs) */}
       <nav

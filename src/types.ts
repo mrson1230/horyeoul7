@@ -73,6 +73,24 @@ export interface EventBanner {
   updatedAt: string;
 }
 
+export type AdSlotMode = 'inquiry' | 'custom' | 'adsense' | 'adfit' | 'hidden';
+
+export interface ExternalAdConfig {
+  apartmentId: string;
+  mode: AdSlotMode;
+  sponsorName: string;
+  headline: string;
+  description: string;
+  imageUrl: string;
+  linkUrl: string;
+  ctaLabel: string;
+  contactInfo: string;
+  adsenseClientId: string;
+  adsenseSlotId: string;
+  adfitUnitId: string;
+  updatedAt: string;
+}
+
 export interface SessionInfo {
   authenticated: boolean;
   isAdmin: boolean;

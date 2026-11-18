@@ -1,14 +1,32 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import type { Request, Response, NextFunction } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import pg from 'pg';
+
+const { Pool } = pg;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATA_DIR = path.resolve(__dirname, 'data');
+const IS_VERCEL = Boolean(
+  process.env.VERCEL || process.env.VERCEL_ENV || process.env.NOW_REGION
+);
+const PG_CONNECTION_STRING = (
+  process.env.DATABASE_URL ||
+  process.env.POSTGRES_URL ||
+  process.env.POSTGRES_URL_NON_POOLING ||
+  process.env.SUPABASE_DB_URL ||
+  ''
+).trim();
+const USE_POSTGRES = PG_CONNECTION_STRING.length > 0;
+
+const DATA_DIR = IS_VERCEL
+  ? path.join(os.tmpdir(), 'apt-worklog-data')
+  : path.resolve(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const STORE_PATH = path.join(DATA_DIR, 'store.json');
 const DEFAULT_APARTMENT_ID = 'apt-horyeoul7';
@@ -90,6 +108,24 @@ interface EventBannerRecord {
   updatedAt: string;
 }
 
+type AdSlotMode = 'inquiry' | 'custom' | 'adsense' | 'adfit' | 'hidden';
+
+interface ExternalAdRecord {
+  apartmentId: string;
+  mode: AdSlotMode;
+  sponsorName: string;
+  headline: string;
+  description: string;
+  imageUrl: string;
+  linkUrl: string;
+  ctaLabel: string;
+  contactInfo: string;
+  adsenseClientId: string;
+  adsenseSlotId: string;
+  adfitUnitId: string;
+  updatedAt: string;
+}
+
 interface SessionRecord {
   token: string;
   apartmentId: string;
@@ -112,7 +148,28 @@ interface StoreData {
   notices: NoticeRecord[];
   handovers: HandoverRecord[];
   banners?: EventBannerRecord[];
+  externalAds?: Record<string, ExternalAdRecord>;
   sessions: Record<string, SessionRecord>;
+}
+
+let memoryStore: StoreData | null = null;
+let pgPool: pg.Pool | null = null;
+let pgInitPromise: Promise<void> | null = null;
+
+function getPgPool(): pg.Pool {
+  if (!pgPool) {
+    const needsSsl =
+      PG_CONNECTION_STRING.length > 0 &&
+      !/localhost|127\.0\.0\.1|sslmode=disable/i.test(PG_CONNECTION_STRING);
+    pgPool = new Pool({
+      connectionString: PG_CONNECTION_STRING,
+      max: IS_VERCEL ? 5 : 10,
+      idleTimeoutMillis: 20000,
+      connectionTimeoutMillis: 10000,
+      ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
+    });
+  }
+  return pgPool;
 }
 
 function getKoreaDateString(offsetDays = 0): string {
@@ -287,24 +344,249 @@ function createInitialStore(): StoreData {
     notices: createSeedNotices(),
     handovers: createSeedHandovers(),
     banners: [],
+    externalAds: {},
     sessions: {},
   };
 }
 
+async function ensurePgReady(): Promise<void> {
+  if (!USE_POSTGRES) return;
+  if (pgInitPromise) return pgInitPromise;
+
+  pgInitPromise = (async () => {
+    const pool = getPgPool();
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS apartments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        office_name TEXT NOT NULL,
+        company_id TEXT NOT NULL UNIQUE,
+        company_password TEXT NOT NULL,
+        admin_password TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workers (
+        id TEXT PRIMARY KEY,
+        apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_workers_apartment ON workers (apartment_id);
+
+      CREATE TABLE IF NOT EXISTS work_logs (
+        id TEXT PRIMARY KEY,
+        apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+        worker_id TEXT NOT NULL,
+        worker_name TEXT NOT NULL,
+        worker_role TEXT NOT NULL,
+        work_date TEXT NOT NULL,
+        location TEXT NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'completed',
+        photo_url TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_work_logs_apartment_date ON work_logs (apartment_id, work_date DESC, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS notices (
+        id TEXT PRIMARY KEY,
+        apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+        author_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_notices_apartment ON notices (apartment_id, is_pinned DESC, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS handovers (
+        id TEXT PRIMARY KEY,
+        apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+        worker_id TEXT NOT NULL,
+        worker_name TEXT NOT NULL,
+        worker_role TEXT NOT NULL,
+        target_shift TEXT NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        completed_by TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_handovers_apartment ON handovers (apartment_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS event_banners (
+        id TEXT PRIMARY KEY,
+        apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+        category TEXT NOT NULL,
+        title TEXT NOT NULL,
+        subtitle TEXT NOT NULL DEFAULT '',
+        event_date TEXT NOT NULL DEFAULT '',
+        event_location TEXT NOT NULL DEFAULT '',
+        contact_info TEXT NOT NULL DEFAULT '',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_event_banners_apartment ON event_banners (apartment_id, is_active DESC, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions (last_seen_at);
+
+      CREATE TABLE IF NOT EXISTS external_ads (
+        apartment_id TEXT PRIMARY KEY REFERENCES apartments(id) ON DELETE CASCADE,
+        mode TEXT NOT NULL DEFAULT 'inquiry',
+        sponsor_name TEXT NOT NULL DEFAULT '',
+        headline TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        image_url TEXT NOT NULL DEFAULT '',
+        link_url TEXT NOT NULL DEFAULT '',
+        cta_label TEXT NOT NULL DEFAULT '',
+        contact_info TEXT NOT NULL DEFAULT '',
+        adsense_client_id TEXT NOT NULL DEFAULT '',
+        adsense_slot_id TEXT NOT NULL DEFAULT '',
+        adfit_unit_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
+    `);
+
+    const countRes = await pool.query<{ cnt: number }>(
+      'SELECT COUNT(*)::int AS cnt FROM apartments'
+    );
+    if ((countRes.rows[0]?.cnt ?? 0) === 0) {
+      const seed = createInitialStore();
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (const apt of seed.apartments) {
+          await client.query(
+            `INSERT INTO apartments (id, name, office_name, company_id, company_password, admin_password, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
+            [
+              apt.id,
+              apt.name,
+              apt.officeName,
+              apt.companyId,
+              apt.companyPassword,
+              apt.adminPassword,
+              apt.createdAt,
+            ]
+          );
+        }
+        for (const w of seed.workers) {
+          await client.query(
+            `INSERT INTO workers (id, apartment_id, name, role, created_at)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`,
+            [w.id, w.apartmentId, w.name, w.role, w.createdAt]
+          );
+        }
+        for (const l of seed.logs) {
+          await client.query(
+            `INSERT INTO work_logs (id, apartment_id, worker_id, worker_name, worker_role, work_date, location, content, status, photo_url, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO NOTHING`,
+            [
+              l.id,
+              l.apartmentId,
+              l.workerId,
+              l.workerName,
+              l.workerRole,
+              l.workDate,
+              l.location,
+              l.content,
+              l.status,
+              l.photoUrl,
+              l.createdAt,
+              l.updatedAt,
+            ]
+          );
+        }
+        for (const n of seed.notices) {
+          await client.query(
+            `INSERT INTO notices (id, apartment_id, title, content, is_pinned, author_name, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
+            [
+              n.id,
+              n.apartmentId,
+              n.title,
+              n.content,
+              n.isPinned,
+              n.authorName,
+              n.createdAt,
+              n.updatedAt,
+            ]
+          );
+        }
+        for (const h of seed.handovers) {
+          await client.query(
+            `INSERT INTO handovers (id, apartment_id, worker_id, worker_name, worker_role, target_shift, content, status, completed_by, completed_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO NOTHING`,
+            [
+              h.id,
+              h.apartmentId,
+              h.workerId,
+              h.workerName,
+              h.workerRole,
+              h.targetShift,
+              h.content,
+              h.status,
+              h.completedBy,
+              h.completedAt,
+              h.createdAt,
+              h.updatedAt,
+            ]
+          );
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
+  })().catch((err) => {
+    pgInitPromise = null;
+    throw err;
+  });
+
+  return pgInitPromise;
+}
+
 function ensureStorage(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(STORE_PATH)) {
-    const initial = createInitialStore();
-    fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), 'utf8');
+  if (USE_POSTGRES) return;
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(UPLOADS_DIR)) {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(STORE_PATH)) {
+      const initial = memoryStore || createInitialStore();
+      memoryStore = initial;
+      fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), 'utf8');
+    }
+  } catch {
+    if (!memoryStore) {
+      memoryStore = createInitialStore();
+    }
   }
 }
 
 function readStore(): StoreData {
+  if (IS_VERCEL && memoryStore) {
+    return memoryStore;
+  }
   ensureStorage();
   try {
     const raw = fs.readFileSync(STORE_PATH, 'utf8');
@@ -347,8 +629,11 @@ function readStore(): StoreData {
       parsed.banners = [];
       mutated = true;
     }
+    if (!parsed.externalAds || typeof parsed.externalAds !== 'object') {
+      parsed.externalAds = {};
+      mutated = true;
+    }
 
-    // Backfill apartmentId for any legacy records
     for (const w of parsed.workers) {
       if (!w.apartmentId) {
         w.apartmentId = DEFAULT_APARTMENT_ID;
@@ -384,22 +669,30 @@ function readStore(): StoreData {
       }
     }
 
+    memoryStore = parsed;
     if (mutated) {
       writeStore(parsed);
     }
     return parsed;
   } catch {
-    const initial = createInitialStore();
-    writeStore(initial);
-    return initial;
+    if (!memoryStore) {
+      memoryStore = createInitialStore();
+    }
+    writeStore(memoryStore);
+    return memoryStore;
   }
 }
 
 function writeStore(data: StoreData): void {
-  ensureStorage();
-  const tmpPath = `${STORE_PATH}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmpPath, STORE_PATH);
+  memoryStore = data;
+  try {
+    ensureStorage();
+    const tmpPath = `${STORE_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmpPath, STORE_PATH);
+  } catch {
+    // Keep memoryStore as fallback on read-only serverless filesystems
+  }
 }
 
 function toPublicApartment(apt: ApartmentRecord) {
@@ -410,6 +703,161 @@ function toPublicApartment(apt: ApartmentRecord) {
     companyId: apt.companyId,
     createdAt: apt.createdAt,
   };
+}
+
+function mapApartmentRow(r: Record<string, unknown>): ApartmentRecord {
+  return {
+    id: String(r.id),
+    name: String(r.name),
+    officeName: String(r.office_name),
+    companyId: String(r.company_id),
+    companyPassword: String(r.company_password),
+    adminPassword: String(r.admin_password),
+    createdAt: String(r.created_at),
+  };
+}
+
+function mapWorkerRow(r: Record<string, unknown>): WorkerRecord {
+  return {
+    id: String(r.id),
+    apartmentId: String(r.apartment_id),
+    name: String(r.name),
+    role: String(r.role),
+    createdAt: String(r.created_at),
+  };
+}
+
+function mapLogRow(r: Record<string, unknown>): WorkLogRecord {
+  const rawStatus = String(r.status || 'completed');
+  const status: WorkStatus =
+    rawStatus === 'pending' || rawStatus === 'in_progress'
+      ? rawStatus
+      : 'completed';
+  return {
+    id: String(r.id),
+    apartmentId: String(r.apartment_id),
+    workerId: String(r.worker_id),
+    workerName: String(r.worker_name),
+    workerRole: String(r.worker_role),
+    workDate: String(r.work_date),
+    location: String(r.location),
+    content: String(r.content),
+    status,
+    photoUrl: r.photo_url ? String(r.photo_url) : null,
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function mapNoticeRow(r: Record<string, unknown>): NoticeRecord {
+  return {
+    id: String(r.id),
+    apartmentId: String(r.apartment_id),
+    title: String(r.title),
+    content: String(r.content),
+    isPinned: Boolean(r.is_pinned),
+    authorName: String(r.author_name),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function mapHandoverRow(r: Record<string, unknown>): HandoverRecord {
+  return {
+    id: String(r.id),
+    apartmentId: String(r.apartment_id),
+    workerId: String(r.worker_id),
+    workerName: String(r.worker_name),
+    workerRole: String(r.worker_role),
+    targetShift: String(r.target_shift),
+    content: String(r.content),
+    status: r.status === 'completed' ? 'completed' : 'pending',
+    completedBy: r.completed_by ? String(r.completed_by) : null,
+    completedAt: r.completed_at ? String(r.completed_at) : null,
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function mapBannerRow(r: Record<string, unknown>): EventBannerRecord {
+  const cat = String(r.category || 'notice');
+  const category: BannerCategory =
+    cat === 'wedding' ||
+    cat === 'funeral' ||
+    cat === 'celebration' ||
+    cat === 'notice'
+      ? cat
+      : 'notice';
+  return {
+    id: String(r.id),
+    apartmentId: String(r.apartment_id),
+    category,
+    title: String(r.title),
+    subtitle: String(r.subtitle || ''),
+    eventDate: String(r.event_date || ''),
+    eventLocation: String(r.event_location || ''),
+    contactInfo: String(r.contact_info || ''),
+    isActive: Boolean(r.is_active),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function createDefaultExternalAd(apartmentId: string): ExternalAdRecord {
+  return {
+    apartmentId,
+    mode: 'inquiry',
+    sponsorName: '지역 상가 · 파트너 광고 영역',
+    headline: '이 자리에 외부 광고 및 제휴 배너를 게재할 수 있습니다',
+    description:
+      '단지 인근 상가·협력업체 배너, Google AdSense, 카카오 애드핏 연동을 지원합니다.',
+    imageUrl: '',
+    linkUrl: '',
+    ctaLabel: '자세히 보기',
+    contactInfo: '관리자 메뉴 > 하단 외부 광고 설정에서 변경 가능',
+    adsenseClientId: '',
+    adsenseSlotId: '',
+    adfitUnitId: '',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function mapExternalAdRow(r: Record<string, unknown>): ExternalAdRecord {
+  const rawMode = String(r.mode || 'inquiry');
+  const validModes: AdSlotMode[] = [
+    'inquiry',
+    'custom',
+    'adsense',
+    'adfit',
+    'hidden',
+  ];
+  const mode: AdSlotMode = validModes.includes(rawMode as AdSlotMode)
+    ? (rawMode as AdSlotMode)
+    : 'inquiry';
+  return {
+    apartmentId: String(r.apartment_id),
+    mode,
+    sponsorName: String(r.sponsor_name || ''),
+    headline: String(r.headline || ''),
+    description: String(r.description || ''),
+    imageUrl: String(r.image_url || ''),
+    linkUrl: String(r.link_url || ''),
+    ctaLabel: String(r.cta_label || ''),
+    contactInfo: String(r.contact_info || ''),
+    adsenseClientId: String(r.adsense_client_id || ''),
+    adsenseSlotId: String(r.adsense_slot_id || ''),
+    adfitUnitId: String(r.adfit_unit_id || ''),
+    updatedAt: String(r.updated_at || new Date().toISOString()),
+  };
+}
+
+function sanitizeExternalHttpUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed.slice(0, 500);
+  }
+  return '';
 }
 
 function saveBase64Photo(dataUrl: string): string | null {
@@ -424,10 +872,18 @@ function saveBase64Photo(dataUrl: string): string | null {
     throw new Error('사진 용량은 5MB 이하만 등록할 수 있습니다.');
   }
 
-  ensureStorage();
-  const filename = `work_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
-  fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
-  return `/api/uploads/${filename}`;
+  if (USE_POSTGRES || IS_VERCEL) {
+    return dataUrl;
+  }
+
+  try {
+    ensureStorage();
+    const filename = `work_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+    fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
+    return `/api/uploads/${filename}`;
+  } catch {
+    return dataUrl;
+  }
 }
 
 function deleteUploadedPhotoIfLocal(photoUrl: string | null): void {
@@ -459,21 +915,55 @@ interface AuthedRequest extends Request {
   session?: SessionRecord;
 }
 
-function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const token = extractToken(req);
-  if (!token) {
-    res.status(401).json({ error: '로그인이 필요합니다.' });
-    return;
+type AsyncRouteHandler = (
+  req: AuthedRequest,
+  res: Response,
+  next: NextFunction
+) => Promise<void> | void;
+
+function asyncHandler(fn: AsyncRouteHandler) {
+  return (req: AuthedRequest, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+async function findSessionByToken(token: string): Promise<SessionRecord | null> {
+  if (USE_POSTGRES) {
+    await ensurePgReady();
+    const res = await getPgPool().query(
+      'SELECT token, apartment_id, is_admin, created_at, last_seen_at FROM sessions WHERE token = $1',
+      [token]
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    return {
+      token: String(row.token),
+      apartmentId: String(row.apartment_id),
+      isAdmin: Boolean(row.is_admin),
+      createdAt: String(row.created_at),
+      lastSeenAt: String(row.last_seen_at),
+    };
   }
   const store = readStore();
-  const session = store.sessions[token];
-  if (!session) {
-    res.status(401).json({ error: '세션이 만료되었습니다. 다시 로그인해 주세요.' });
-    return;
-  }
-  req.session = session;
-  next();
+  return store.sessions[token] || null;
 }
+
+const requireAuth = asyncHandler(
+  async (req: AuthedRequest, res: Response, next: NextFunction) => {
+    const token = extractToken(req);
+    if (!token) {
+      res.status(401).json({ error: '로그인이 필요합니다.' });
+      return;
+    }
+    const session = await findSessionByToken(token);
+    if (!session) {
+      res.status(401).json({ error: '세션이 만료되었습니다. 다시 로그인해 주세요.' });
+      return;
+    }
+    req.session = session;
+    next();
+  }
+);
 
 function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction): void {
   if (!req.session?.isAdmin) {
@@ -505,7 +995,41 @@ function formatKoreanTimestamp(iso: string): string {
   });
 }
 
-async function startServer() {
+function filterAndSortLogs(
+  logs: WorkLogRecord[],
+  query: { workerId?: string; date?: string; q?: string; status?: string }
+): WorkLogRecord[] {
+  let result = logs;
+  if (query.workerId && query.workerId !== 'all') {
+    result = result.filter(
+      (l) => l.workerId === query.workerId || l.workerName === query.workerId
+    );
+  }
+  if (query.status && query.status !== 'all') {
+    result = result.filter((l) => (l.status || 'completed') === query.status);
+  }
+  if (query.date && query.date.trim() !== '') {
+    const targetDate = query.date.trim();
+    result = result.filter((l) => l.workDate === targetDate);
+  }
+  if (query.q && query.q.trim() !== '') {
+    const keyword = query.q.trim().toLowerCase();
+    result = result.filter(
+      (l) =>
+        l.location.toLowerCase().includes(keyword) ||
+        l.content.toLowerCase().includes(keyword) ||
+        l.workerName.toLowerCase().includes(keyword)
+    );
+  }
+  return [...result].sort((a, b) => {
+    if (a.workDate !== b.workDate) {
+      return b.workDate.localeCompare(a.workDate);
+    }
+    return b.createdAt.localeCompare(a.createdAt);
+  });
+}
+
+export function createApp(): express.Express {
   ensureStorage();
   const app = express();
   app.use(express.json({ limit: '10mb' }));
@@ -520,145 +1044,288 @@ async function startServer() {
     res.sendFile(fullPath);
   });
 
-  app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true });
-  });
+  app.get(
+    '/api/health',
+    asyncHandler(async (_req: Request, res: Response) => {
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        await getPgPool().query('SELECT 1');
+        res.json({ ok: true, storage: 'postgres' });
+        return;
+      }
+      res.json({ ok: true, storage: IS_VERCEL ? 'memory' : 'file' });
+    })
+  );
 
-  // Public list of registered apartments (safe fields only)
-  app.get('/api/apartments', (_req: Request, res: Response) => {
-    const store = readStore();
-    res.json({
-      apartments: store.apartments.map(toPublicApartment),
-    });
-  });
-
-  // Register a new apartment complex (accessible from login & admin)
-  app.post('/api/apartments', (req: Request, res: Response) => {
-    const {
-      name,
-      officeName,
-      companyId,
-      companyPassword,
-      adminPassword,
-      autoLogin,
-    } = req.body as {
-      name?: string;
-      officeName?: string;
-      companyId?: string;
-      companyPassword?: string;
-      adminPassword?: string;
-      autoLogin?: boolean;
-    };
-
-    const cleanName = (name || '').trim();
-    const cleanOfficeName =
-      (officeName || '').trim() || (cleanName ? `${cleanName} 관리사무소` : '');
-    const cleanCompanyId = (companyId || '').trim().toLowerCase();
-    const cleanCompanyPw = (companyPassword || '').trim();
-    const cleanAdminPw = (adminPassword || '').trim();
-
-    if (!cleanName) {
-      res.status(400).json({ error: '아파트 단지명을 입력해 주세요.' });
-      return;
-    }
-    if (!/^[a-z0-9_-]{3,30}$/.test(cleanCompanyId)) {
-      res.status(400).json({
-        error: '공통 아이디는 영문 소문자, 숫자, -, _ 조합 3~30자로 입력해 주세요.',
+  // Public list of registered apartments
+  app.get(
+    '/api/apartments',
+    asyncHandler(async (_req: Request, res: Response) => {
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = await getPgPool().query(
+          'SELECT * FROM apartments ORDER BY created_at ASC'
+        );
+        res.json({
+          apartments: result.rows.map(mapApartmentRow).map(toPublicApartment),
+        });
+        return;
+      }
+      const store = readStore();
+      res.json({
+        apartments: store.apartments.map(toPublicApartment),
       });
-      return;
-    }
-    if (cleanCompanyPw.length < 4) {
-      res.status(400).json({ error: '공통 비밀번호는 4자 이상이어야 합니다.' });
-      return;
-    }
-    if (cleanAdminPw.length < 4) {
-      res.status(400).json({ error: '관리자 비밀번호는 4자 이상이어야 합니다.' });
-      return;
-    }
+    })
+  );
 
-    const store = readStore();
-    if (store.apartments.some((a) => a.companyId.toLowerCase() === cleanCompanyId)) {
-      res.status(409).json({ error: '이미 사용 중인 회사 공통 아이디입니다.' });
-      return;
-    }
-    if (store.apartments.some((a) => a.name === cleanName)) {
-      res.status(409).json({ error: '이미 등록된 아파트 단지명입니다.' });
-      return;
-    }
-
-    const nowIso = new Date().toISOString();
-    const newApt: ApartmentRecord = {
-      id: `apt-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
-      name: cleanName,
-      officeName: cleanOfficeName,
-      companyId: cleanCompanyId,
-      companyPassword: cleanCompanyPw,
-      adminPassword: cleanAdminPw,
-      createdAt: nowIso,
-    };
-    store.apartments.push(newApt);
-
-    // Seed welcome notice for the newly registered apartment
-    store.notices.unshift({
-      id: `notice-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
-      apartmentId: newApt.id,
-      title: `${cleanName} 공동 작업일지 운영 시작 안내`,
-      content:
-        '관리자 관리 화면에서 직원 명단을 등록하시면 바로 작업일지 작성 및 인수인계 공유를 시작할 수 있습니다.',
-      isPinned: true,
-      authorName: '관리사무소',
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    });
-
-    let token: string | undefined;
-    if (autoLogin) {
-      token = crypto.randomBytes(24).toString('hex');
-      store.sessions[token] = {
-        token,
-        apartmentId: newApt.id,
-        isAdmin: true,
-        createdAt: nowIso,
-        lastSeenAt: nowIso,
+  // Register a new apartment complex
+  app.post(
+    '/api/apartments',
+    asyncHandler(async (req: Request, res: Response) => {
+      const {
+        name,
+        officeName,
+        companyId,
+        companyPassword,
+        adminPassword,
+        autoLogin,
+      } = req.body as {
+        name?: string;
+        officeName?: string;
+        companyId?: string;
+        companyPassword?: string;
+        adminPassword?: string;
+        autoLogin?: boolean;
       };
-    }
 
-    writeStore(store);
-    res.status(201).json({
-      apartment: toPublicApartment(newApt),
-      token,
-      session: token
-        ? {
-            authenticated: true,
-            isAdmin: true,
-            companyId: newApt.companyId,
-            apartmentId: newApt.id,
-            apartmentName: newApt.name,
-            officeName: newApt.officeName,
+      const cleanName = (name || '').trim();
+      const cleanOfficeName =
+        (officeName || '').trim() ||
+        (cleanName ? `${cleanName} 관리사무소` : '');
+      const cleanCompanyId = (companyId || '').trim().toLowerCase();
+      const cleanCompanyPw = (companyPassword || '').trim();
+      const cleanAdminPw = (adminPassword || '').trim();
+
+      if (!cleanName) {
+        res.status(400).json({ error: '아파트 단지명을 입력해 주세요.' });
+        return;
+      }
+      if (!/^[a-z0-9_-]{3,30}$/.test(cleanCompanyId)) {
+        res.status(400).json({
+          error:
+            '공통 아이디는 영문 소문자, 숫자, -, _ 조합 3~30자로 입력해 주세요.',
+        });
+        return;
+      }
+      if (cleanCompanyPw.length < 4) {
+        res
+          .status(400)
+          .json({ error: '공통 비밀번호는 4자 이상이어야 합니다.' });
+        return;
+      }
+      if (cleanAdminPw.length < 4) {
+        res
+          .status(400)
+          .json({ error: '관리자 비밀번호는 4자 이상이어야 합니다.' });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const newApt: ApartmentRecord = {
+        id: `apt-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+        name: cleanName,
+        officeName: cleanOfficeName,
+        companyId: cleanCompanyId,
+        companyPassword: cleanCompanyPw,
+        adminPassword: cleanAdminPw,
+        createdAt: nowIso,
+      };
+      const welcomeNotice: NoticeRecord = {
+        id: `notice-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+        apartmentId: newApt.id,
+        title: `${cleanName} 공동 작업일지 운영 시작 안내`,
+        content:
+          '관리자 관리 화면에서 직원 명단을 등록하시면 바로 작업일지 작성 및 인수인계 공유를 시작할 수 있습니다.',
+        isPinned: true,
+        authorName: '관리사무소',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      let token: string | undefined;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const dupId = await pool.query(
+          'SELECT 1 FROM apartments WHERE LOWER(company_id) = $1 LIMIT 1',
+          [cleanCompanyId]
+        );
+        if (dupId.rows.length > 0) {
+          res
+            .status(409)
+            .json({ error: '이미 사용 중인 회사 공통 아이디입니다.' });
+          return;
+        }
+        const dupName = await pool.query(
+          'SELECT 1 FROM apartments WHERE name = $1 LIMIT 1',
+          [cleanName]
+        );
+        if (dupName.rows.length > 0) {
+          res.status(409).json({ error: '이미 등록된 아파트 단지명입니다.' });
+          return;
+        }
+
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(
+            `INSERT INTO apartments (id, name, office_name, company_id, company_password, admin_password, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              newApt.id,
+              newApt.name,
+              newApt.officeName,
+              newApt.companyId,
+              newApt.companyPassword,
+              newApt.adminPassword,
+              newApt.createdAt,
+            ]
+          );
+          await client.query(
+            `INSERT INTO notices (id, apartment_id, title, content, is_pinned, author_name, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              welcomeNotice.id,
+              welcomeNotice.apartmentId,
+              welcomeNotice.title,
+              welcomeNotice.content,
+              welcomeNotice.isPinned,
+              welcomeNotice.authorName,
+              welcomeNotice.createdAt,
+              welcomeNotice.updatedAt,
+            ]
+          );
+          if (autoLogin) {
+            token = crypto.randomBytes(24).toString('hex');
+            await client.query(
+              `INSERT INTO sessions (token, apartment_id, is_admin, created_at, last_seen_at)
+               VALUES ($1, $2, $3, $4, $5)`,
+              [token, newApt.id, true, nowIso, nowIso]
+            );
           }
-        : undefined,
-    });
-  });
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        } finally {
+          client.release();
+        }
+      } else {
+        const store = readStore();
+        if (
+          store.apartments.some(
+            (a) => a.companyId.toLowerCase() === cleanCompanyId
+          )
+        ) {
+          res
+            .status(409)
+            .json({ error: '이미 사용 중인 회사 공통 아이디입니다.' });
+          return;
+        }
+        if (store.apartments.some((a) => a.name === cleanName)) {
+          res.status(409).json({ error: '이미 등록된 아파트 단지명입니다.' });
+          return;
+        }
+
+        store.apartments.push(newApt);
+        store.notices.unshift(welcomeNotice);
+
+        if (autoLogin) {
+          token = crypto.randomBytes(24).toString('hex');
+          store.sessions[token] = {
+            token,
+            apartmentId: newApt.id,
+            isAdmin: true,
+            createdAt: nowIso,
+            lastSeenAt: nowIso,
+          };
+        }
+        writeStore(store);
+      }
+
+      res.status(201).json({
+        apartment: toPublicApartment(newApt),
+        token,
+        session: token
+          ? {
+              authenticated: true,
+              isAdmin: true,
+              companyId: newApt.companyId,
+              apartmentId: newApt.id,
+              apartmentName: newApt.name,
+              officeName: newApt.officeName,
+            }
+          : undefined,
+      });
+    })
+  );
 
   // Update current apartment info (Admin only)
   app.patch(
     '/api/apartments/current',
     requireAuth,
     requireAdmin,
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
       const { name, officeName } = req.body as {
         name?: string;
         officeName?: string;
       };
+      const apartmentId = req.session!.apartmentId;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const existingRes = await pool.query(
+          'SELECT * FROM apartments WHERE id = $1',
+          [apartmentId]
+        );
+        if (existingRes.rows.length === 0) {
+          res.status(404).json({ error: '아파트 정보를 찾을 수 없습니다.' });
+          return;
+        }
+        const apt = mapApartmentRow(existingRes.rows[0]);
+        const cleanName = (name ?? apt.name).trim();
+        const cleanOffice =
+          (officeName ?? apt.officeName).trim() || `${cleanName} 관리사무소`;
+        if (!cleanName) {
+          res.status(400).json({ error: '아파트 단지명을 입력해 주세요.' });
+          return;
+        }
+        await pool.query(
+          'UPDATE apartments SET name = $1, office_name = $2 WHERE id = $3',
+          [cleanName, cleanOffice, apartmentId]
+        );
+        res.json({
+          apartment: toPublicApartment({
+            ...apt,
+            name: cleanName,
+            officeName: cleanOffice,
+          }),
+        });
+        return;
+      }
+
       const store = readStore();
-      const apt = store.apartments.find((a) => a.id === req.session!.apartmentId);
+      const apt = store.apartments.find((a) => a.id === apartmentId);
       if (!apt) {
         res.status(404).json({ error: '아파트 정보를 찾을 수 없습니다.' });
         return;
       }
 
       const cleanName = (name ?? apt.name).trim();
-      const cleanOffice = (officeName ?? apt.officeName).trim() || `${cleanName} 관리사무소`;
+      const cleanOffice =
+        (officeName ?? apt.officeName).trim() || `${cleanName} 관리사무소`;
       if (!cleanName) {
         res.status(400).json({ error: '아파트 단지명을 입력해 주세요.' });
         return;
@@ -668,321 +1335,587 @@ async function startServer() {
       apt.officeName = cleanOffice;
       writeStore(store);
       res.json({ apartment: toPublicApartment(apt) });
-    }
+    })
   );
 
   // Session check
-  app.get('/api/auth/session', (req: Request, res: Response) => {
-    const store = readStore();
-    const defaultApt = store.apartments[0];
-    const token = extractToken(req);
-    const session = token ? store.sessions[token] : undefined;
+  app.get(
+    '/api/auth/session',
+    asyncHandler(async (req: Request, res: Response) => {
+      const token = extractToken(req);
 
-    if (!session) {
-      res.json({
-        authenticated: false,
-        isAdmin: false,
-        companyId: defaultApt.companyId,
-        apartmentId: defaultApt.id,
-        apartmentName: defaultApt.name,
-        officeName: defaultApt.officeName,
-      });
-      return;
-    }
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const aptsRes = await pool.query(
+          'SELECT * FROM apartments ORDER BY created_at ASC'
+        );
+        const apartments = aptsRes.rows.map(mapApartmentRow);
+        const defaultApt = apartments[0];
+        const session = token ? await findSessionByToken(token) : null;
 
-    const apt =
-      store.apartments.find((a) => a.id === session.apartmentId) || defaultApt;
-    res.json({
-      authenticated: true,
-      isAdmin: session.isAdmin,
-      companyId: apt.companyId,
-      apartmentId: apt.id,
-      apartmentName: apt.name,
-      officeName: apt.officeName,
-    });
-  });
+        if (!session) {
+          res.json({
+            authenticated: false,
+            isAdmin: false,
+            companyId: defaultApt.companyId,
+            apartmentId: defaultApt.id,
+            apartmentName: defaultApt.name,
+            officeName: defaultApt.officeName,
+          });
+          return;
+        }
 
-  // Shared company login (supports multi-apartment)
-  app.post('/api/auth/login', (req: Request, res: Response) => {
-    const { companyId, password, apartmentId } = req.body as {
-      companyId?: string;
-      password?: string;
-      apartmentId?: string;
-    };
-    const store = readStore();
-
-    const trimmedId = (companyId || '').trim().toLowerCase();
-    const apt = apartmentId
-      ? store.apartments.find((a) => a.id === apartmentId)
-      : store.apartments.find((a) => a.companyId.toLowerCase() === trimmedId);
-
-    if (
-      !apt ||
-      !password ||
-      apt.companyId.toLowerCase() !== trimmedId ||
-      password !== apt.companyPassword
-    ) {
-      res.status(401).json({
-        error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
-      });
-      return;
-    }
-
-    const token = crypto.randomBytes(24).toString('hex');
-    const nowIso = new Date().toISOString();
-    store.sessions[token] = {
-      token,
-      apartmentId: apt.id,
-      isAdmin: false,
-      createdAt: nowIso,
-      lastSeenAt: nowIso,
-    };
-
-    const sessionKeys = Object.keys(store.sessions);
-    if (sessionKeys.length > 200) {
-      const sorted = sessionKeys.sort(
-        (a, b) =>
-          new Date(store.sessions[a].lastSeenAt).getTime() -
-          new Date(store.sessions[b].lastSeenAt).getTime()
-      );
-      for (const oldKey of sorted.slice(0, sessionKeys.length - 150)) {
-        delete store.sessions[oldKey];
-      }
-    }
-
-    writeStore(store);
-    res.json({
-      token,
-      authenticated: true,
-      isAdmin: false,
-      companyId: apt.companyId,
-      apartmentId: apt.id,
-      apartmentName: apt.name,
-      officeName: apt.officeName,
-    });
-  });
-
-  app.post('/api/auth/logout', (req: Request, res: Response) => {
-    const token = extractToken(req);
-    if (token) {
-      const store = readStore();
-      if (store.sessions[token]) {
-        delete store.sessions[token];
-        writeStore(store);
-      }
-    }
-    res.json({ ok: true });
-  });
-
-  // Admin unlock / lock (scoped to apartment)
-  app.post('/api/auth/admin/unlock', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { adminPassword } = req.body as { adminPassword?: string };
-    const store = readStore();
-    const apt = store.apartments.find((a) => a.id === req.session!.apartmentId);
-    if (!apt || !adminPassword || adminPassword !== apt.adminPassword) {
-      res.status(401).json({ error: '관리자 비밀번호가 올바르지 않습니다.' });
-      return;
-    }
-    const token = req.session!.token;
-    store.sessions[token].isAdmin = true;
-    store.sessions[token].lastSeenAt = new Date().toISOString();
-    writeStore(store);
-    res.json({ isAdmin: true });
-  });
-
-  app.post('/api/auth/admin/lock', requireAuth, (req: AuthedRequest, res: Response) => {
-    const store = readStore();
-    const token = req.session!.token;
-    if (store.sessions[token]) {
-      store.sessions[token].isAdmin = false;
-      writeStore(store);
-    }
-    res.json({ isAdmin: false });
-  });
-
-  // Workers (scoped to apartment)
-  app.get('/api/workers', requireAuth, (req: AuthedRequest, res: Response) => {
-    const store = readStore();
-    const workers = store.workers.filter(
-      (w) => w.apartmentId === req.session!.apartmentId
-    );
-    res.json({ workers });
-  });
-
-  app.post('/api/workers', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { name, role } = req.body as { name?: string; role?: string };
-    const trimmedName = (name || '').trim();
-    const trimmedRole = (role || '').trim() || '직원';
-    const apartmentId = req.session!.apartmentId;
-
-    if (!trimmedName) {
-      res.status(400).json({ error: '직원 이름을 입력해 주세요.' });
-      return;
-    }
-    if (trimmedName.length > 20) {
-      res.status(400).json({ error: '직원 이름은 20자 이내로 입력해 주세요.' });
-      return;
-    }
-
-    const store = readStore();
-    if (
-      store.workers.some(
-        (w) => w.apartmentId === apartmentId && w.name === trimmedName
-      )
-    ) {
-      res.status(409).json({ error: '이미 등록된 직원 이름입니다.' });
-      return;
-    }
-
-    const newWorker: WorkerRecord = {
-      id: `w-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
-      apartmentId,
-      name: trimmedName,
-      role: trimmedRole,
-      createdAt: new Date().toISOString(),
-    };
-    store.workers.push(newWorker);
-    writeStore(store);
-    res.status(201).json({ worker: newWorker });
-  });
-
-  app.delete('/api/workers/:id', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const store = readStore();
-    const exists = store.workers.some(
-      (w) => w.id === id && w.apartmentId === apartmentId
-    );
-    if (!exists) {
-      res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
-      return;
-    }
-    store.workers = store.workers.filter(
-      (w) => !(w.id === id && w.apartmentId === apartmentId)
-    );
-    writeStore(store);
-    res.json({ ok: true });
-  });
-
-  // Work Logs (scoped to apartment)
-  app.get('/api/logs', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { workerId, date, q, status } = req.query as {
-      workerId?: string;
-      date?: string;
-      q?: string;
-      status?: string;
-    };
-    const apartmentId = req.session!.apartmentId;
-    const store = readStore();
-    let logs = store.logs.filter((l) => l.apartmentId === apartmentId);
-
-    if (workerId && workerId !== 'all') {
-      logs = logs.filter((l) => l.workerId === workerId || l.workerName === workerId);
-    }
-    if (status && status !== 'all') {
-      logs = logs.filter((l) => (l.status || 'completed') === status);
-    }
-    if (date && date.trim() !== '') {
-      logs = logs.filter((l) => l.workDate === date.trim());
-    }
-    if (q && q.trim() !== '') {
-      const keyword = q.trim().toLowerCase();
-      logs = logs.filter(
-        (l) =>
-          l.location.toLowerCase().includes(keyword) ||
-          l.content.toLowerCase().includes(keyword) ||
-          l.workerName.toLowerCase().includes(keyword)
-      );
-    }
-
-    logs.sort((a, b) => {
-      if (a.workDate !== b.workDate) {
-        return b.workDate.localeCompare(a.workDate);
-      }
-      return b.createdAt.localeCompare(a.createdAt);
-    });
-
-    res.json({ logs });
-  });
-
-  app.post('/api/logs', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { workerId, workDate, location, content, status, photoBase64 } = req.body as {
-      workerId?: string;
-      workDate?: string;
-      location?: string;
-      content?: string;
-      status?: WorkStatus;
-      photoBase64?: string | null;
-    };
-
-    const apartmentId = req.session!.apartmentId;
-    const store = readStore();
-    const worker = store.workers.find(
-      (w) => w.id === workerId && w.apartmentId === apartmentId
-    );
-    if (!worker) {
-      res.status(400).json({ error: '목록에서 작업자(직원 이름)를 먼저 선택해 주세요.' });
-      return;
-    }
-    const cleanDate = (workDate || '').trim();
-    const cleanLocation = (location || '').trim();
-    const cleanContent = (content || '').trim();
-    const cleanStatus: WorkStatus =
-      status === 'pending' || status === 'in_progress' || status === 'completed'
-        ? status
-        : 'completed';
-
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) {
-      res.status(400).json({ error: '올바른 작업 날짜를 선택해 주세요.' });
-      return;
-    }
-    if (!cleanLocation) {
-      res.status(400).json({ error: '작업 장소를 입력해 주세요.' });
-      return;
-    }
-    if (!cleanContent) {
-      res.status(400).json({ error: '처리 내용을 입력해 주세요.' });
-      return;
-    }
-
-    let photoUrl: string | null = null;
-    if (photoBase64 && typeof photoBase64 === 'string') {
-      try {
-        photoUrl = saveBase64Photo(photoBase64);
-      } catch (err) {
-        res.status(400).json({
-          error: err instanceof Error ? err.message : '사진 업로드에 실패했습니다.',
+        const apt =
+          apartments.find((a) => a.id === session.apartmentId) || defaultApt;
+        res.json({
+          authenticated: true,
+          isAdmin: session.isAdmin,
+          companyId: apt.companyId,
+          apartmentId: apt.id,
+          apartmentName: apt.name,
+          officeName: apt.officeName,
         });
         return;
       }
-    }
 
-    const nowIso = new Date().toISOString();
-    const newLog: WorkLogRecord = {
-      id: `log-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
-      apartmentId,
-      workerId: worker.id,
-      workerName: worker.name,
-      workerRole: worker.role,
-      workDate: cleanDate,
-      location: cleanLocation,
-      content: cleanContent,
-      status: cleanStatus,
-      photoUrl,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
+      const store = readStore();
+      const defaultApt = store.apartments[0];
+      const session = token ? store.sessions[token] : undefined;
 
-    store.logs.unshift(newLog);
-    writeStore(store);
-    res.status(201).json({ log: newLog });
-  });
+      if (!session) {
+        res.json({
+          authenticated: false,
+          isAdmin: false,
+          companyId: defaultApt.companyId,
+          apartmentId: defaultApt.id,
+          apartmentName: defaultApt.name,
+          officeName: defaultApt.officeName,
+        });
+        return;
+      }
 
-  app.patch('/api/logs/:id', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const { actingWorkerId, workDate, location, content, status, photoBase64, removePhoto } =
-      req.body as {
+      const apt =
+        store.apartments.find((a) => a.id === session.apartmentId) ||
+        defaultApt;
+      res.json({
+        authenticated: true,
+        isAdmin: session.isAdmin,
+        companyId: apt.companyId,
+        apartmentId: apt.id,
+        apartmentName: apt.name,
+        officeName: apt.officeName,
+      });
+    })
+  );
+
+  // Shared company login
+  app.post(
+    '/api/auth/login',
+    asyncHandler(async (req: Request, res: Response) => {
+      const { companyId, password, apartmentId } = req.body as {
+        companyId?: string;
+        password?: string;
+        apartmentId?: string;
+      };
+      const trimmedId = (companyId || '').trim().toLowerCase();
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const aptRes = apartmentId
+          ? await pool.query('SELECT * FROM apartments WHERE id = $1 LIMIT 1', [
+              apartmentId,
+            ])
+          : await pool.query(
+              'SELECT * FROM apartments WHERE LOWER(company_id) = $1 LIMIT 1',
+              [trimmedId]
+            );
+        const apt = aptRes.rows[0] ? mapApartmentRow(aptRes.rows[0]) : null;
+
+        if (
+          !apt ||
+          !password ||
+          apt.companyId.toLowerCase() !== trimmedId ||
+          password !== apt.companyPassword
+        ) {
+          res.status(401).json({
+            error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
+          });
+          return;
+        }
+
+        const token = crypto.randomBytes(24).toString('hex');
+        const nowIso = new Date().toISOString();
+        await pool.query(
+          `INSERT INTO sessions (token, apartment_id, is_admin, created_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [token, apt.id, false, nowIso, nowIso]
+        );
+        await pool.query(`
+          DELETE FROM sessions
+          WHERE token IN (
+            SELECT token FROM sessions ORDER BY last_seen_at DESC OFFSET 150
+          )
+        `);
+
+        res.json({
+          token,
+          authenticated: true,
+          isAdmin: false,
+          companyId: apt.companyId,
+          apartmentId: apt.id,
+          apartmentName: apt.name,
+          officeName: apt.officeName,
+        });
+        return;
+      }
+
+      const store = readStore();
+      const apt = apartmentId
+        ? store.apartments.find((a) => a.id === apartmentId)
+        : store.apartments.find(
+            (a) => a.companyId.toLowerCase() === trimmedId
+          );
+
+      if (
+        !apt ||
+        !password ||
+        apt.companyId.toLowerCase() !== trimmedId ||
+        password !== apt.companyPassword
+      ) {
+        res.status(401).json({
+          error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
+        });
+        return;
+      }
+
+      const token = crypto.randomBytes(24).toString('hex');
+      const nowIso = new Date().toISOString();
+      store.sessions[token] = {
+        token,
+        apartmentId: apt.id,
+        isAdmin: false,
+        createdAt: nowIso,
+        lastSeenAt: nowIso,
+      };
+
+      const sessionKeys = Object.keys(store.sessions);
+      if (sessionKeys.length > 200) {
+        const sorted = sessionKeys.sort(
+          (a, b) =>
+            new Date(store.sessions[a].lastSeenAt).getTime() -
+            new Date(store.sessions[b].lastSeenAt).getTime()
+        );
+        for (const oldKey of sorted.slice(0, sessionKeys.length - 150)) {
+          delete store.sessions[oldKey];
+        }
+      }
+
+      writeStore(store);
+      res.json({
+        token,
+        authenticated: true,
+        isAdmin: false,
+        companyId: apt.companyId,
+        apartmentId: apt.id,
+        apartmentName: apt.name,
+        officeName: apt.officeName,
+      });
+    })
+  );
+
+  app.post(
+    '/api/auth/logout',
+    asyncHandler(async (req: Request, res: Response) => {
+      const token = extractToken(req);
+      if (token) {
+        if (USE_POSTGRES) {
+          await ensurePgReady();
+          await getPgPool().query('DELETE FROM sessions WHERE token = $1', [
+            token,
+          ]);
+        } else {
+          const store = readStore();
+          if (store.sessions[token]) {
+            delete store.sessions[token];
+            writeStore(store);
+          }
+        }
+      }
+      res.json({ ok: true });
+    })
+  );
+
+  // Admin unlock / lock
+  app.post(
+    '/api/auth/admin/unlock',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { adminPassword } = req.body as { adminPassword?: string };
+      const apartmentId = req.session!.apartmentId;
+      const token = req.session!.token;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const aptRes = await pool.query(
+          'SELECT admin_password FROM apartments WHERE id = $1 LIMIT 1',
+          [apartmentId]
+        );
+        const aptRow = aptRes.rows[0];
+        if (
+          !aptRow ||
+          !adminPassword ||
+          adminPassword !== String(aptRow.admin_password)
+        ) {
+          res.status(401).json({ error: '관리자 비밀번호가 올바르지 않습니다.' });
+          return;
+        }
+        await pool.query(
+          'UPDATE sessions SET is_admin = TRUE, last_seen_at = $1 WHERE token = $2',
+          [new Date().toISOString(), token]
+        );
+        res.json({ isAdmin: true });
+        return;
+      }
+
+      const store = readStore();
+      const apt = store.apartments.find((a) => a.id === apartmentId);
+      if (!apt || !adminPassword || adminPassword !== apt.adminPassword) {
+        res.status(401).json({ error: '관리자 비밀번호가 올바르지 않습니다.' });
+        return;
+      }
+      store.sessions[token].isAdmin = true;
+      store.sessions[token].lastSeenAt = new Date().toISOString();
+      writeStore(store);
+      res.json({ isAdmin: true });
+    })
+  );
+
+  app.post(
+    '/api/auth/admin/lock',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const token = req.session!.token;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        await getPgPool().query(
+          'UPDATE sessions SET is_admin = FALSE WHERE token = $1',
+          [token]
+        );
+        res.json({ isAdmin: false });
+        return;
+      }
+      const store = readStore();
+      if (store.sessions[token]) {
+        store.sessions[token].isAdmin = false;
+        writeStore(store);
+      }
+      res.json({ isAdmin: false });
+    })
+  );
+
+  // Workers
+  app.get(
+    '/api/workers',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = await getPgPool().query(
+          'SELECT * FROM workers WHERE apartment_id = $1 ORDER BY created_at ASC',
+          [apartmentId]
+        );
+        res.json({ workers: result.rows.map(mapWorkerRow) });
+        return;
+      }
+      const store = readStore();
+      res.json({
+        workers: store.workers.filter((w) => w.apartmentId === apartmentId),
+      });
+    })
+  );
+
+  app.post(
+    '/api/workers',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { name, role } = req.body as { name?: string; role?: string };
+      const apartmentId = req.session!.apartmentId;
+      const trimmedName = (name || '').trim();
+      const trimmedRole = (role || '').trim() || '직원';
+
+      if (!trimmedName) {
+        res.status(400).json({ error: '직원 이름을 입력해 주세요.' });
+        return;
+      }
+      if (trimmedName.length > 20) {
+        res
+          .status(400)
+          .json({ error: '직원 이름은 20자 이내로 입력해 주세요.' });
+        return;
+      }
+
+      const newWorker: WorkerRecord = {
+        id: `w-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+        apartmentId,
+        name: trimmedName,
+        role: trimmedRole,
+        createdAt: new Date().toISOString(),
+      };
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const dup = await pool.query(
+          'SELECT 1 FROM workers WHERE apartment_id = $1 AND name = $2 LIMIT 1',
+          [apartmentId, trimmedName]
+        );
+        if (dup.rows.length > 0) {
+          res.status(409).json({ error: '이미 등록된 직원 이름입니다.' });
+          return;
+        }
+        await pool.query(
+          `INSERT INTO workers (id, apartment_id, name, role, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [
+            newWorker.id,
+            newWorker.apartmentId,
+            newWorker.name,
+            newWorker.role,
+            newWorker.createdAt,
+          ]
+        );
+        res.status(201).json({ worker: newWorker });
+        return;
+      }
+
+      const store = readStore();
+      if (
+        store.workers.some(
+          (w) => w.apartmentId === apartmentId && w.name === trimmedName
+        )
+      ) {
+        res.status(409).json({ error: '이미 등록된 직원 이름입니다.' });
+        return;
+      }
+
+      store.workers.push(newWorker);
+      writeStore(store);
+      res.status(201).json({ worker: newWorker });
+    })
+  );
+
+  app.delete(
+    '/api/workers/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = await getPgPool().query(
+          'DELETE FROM workers WHERE id = $1 AND apartment_id = $2 RETURNING id',
+          [id, apartmentId]
+        );
+        if (result.rows.length === 0) {
+          res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
+          return;
+        }
+        res.json({ ok: true });
+        return;
+      }
+
+      const store = readStore();
+      const exists = store.workers.some(
+        (w) => w.id === id && w.apartmentId === apartmentId
+      );
+      if (!exists) {
+        res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
+        return;
+      }
+      store.workers = store.workers.filter(
+        (w) => !(w.id === id && w.apartmentId === apartmentId)
+      );
+      writeStore(store);
+      res.json({ ok: true });
+    })
+  );
+
+  // Work Logs
+  app.get(
+    '/api/logs',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const query = req.query as {
+        workerId?: string;
+        date?: string;
+        q?: string;
+        status?: string;
+      };
+      const apartmentId = req.session!.apartmentId;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = await getPgPool().query(
+          'SELECT * FROM work_logs WHERE apartment_id = $1 ORDER BY work_date DESC, created_at DESC',
+          [apartmentId]
+        );
+        const logs = filterAndSortLogs(result.rows.map(mapLogRow), query);
+        res.json({ logs });
+        return;
+      }
+
+      const store = readStore();
+      const logs = filterAndSortLogs(
+        store.logs.filter((l) => l.apartmentId === apartmentId),
+        query
+      );
+      res.json({ logs });
+    })
+  );
+
+  app.post(
+    '/api/logs',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { workerId, workDate, location, content, status, photoBase64 } =
+        req.body as {
+          workerId?: string;
+          workDate?: string;
+          location?: string;
+          content?: string;
+          status?: WorkStatus;
+          photoBase64?: string | null;
+        };
+
+      const apartmentId = req.session!.apartmentId;
+      let worker: WorkerRecord | undefined;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const wRes = await getPgPool().query(
+          'SELECT * FROM workers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [workerId || '', apartmentId]
+        );
+        worker = wRes.rows[0] ? mapWorkerRow(wRes.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        worker = store.workers.find(
+          (w) => w.id === workerId && w.apartmentId === apartmentId
+        );
+      }
+
+      if (!worker) {
+        res.status(400).json({
+          error: '목록에서 작업자(직원 이름)를 먼저 선택해 주세요.',
+        });
+        return;
+      }
+
+      const cleanDate = (workDate || '').trim();
+      const cleanLocation = (location || '').trim();
+      const cleanContent = (content || '').trim();
+      const cleanStatus: WorkStatus =
+        status === 'pending' ||
+        status === 'in_progress' ||
+        status === 'completed'
+          ? status
+          : 'completed';
+
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) {
+        res.status(400).json({ error: '올바른 작업 날짜를 선택해 주세요.' });
+        return;
+      }
+      if (!cleanLocation) {
+        res.status(400).json({ error: '작업 장소를 입력해 주세요.' });
+        return;
+      }
+      if (!cleanContent) {
+        res.status(400).json({ error: '처리 내용을 입력해 주세요.' });
+        return;
+      }
+
+      let photoUrl: string | null = null;
+      if (photoBase64 && typeof photoBase64 === 'string') {
+        try {
+          photoUrl = saveBase64Photo(photoBase64);
+        } catch (err) {
+          res.status(400).json({
+            error:
+              err instanceof Error
+                ? err.message
+                : '사진 업로드에 실패했습니다.',
+          });
+          return;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const newLog: WorkLogRecord = {
+        id: `log-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+        apartmentId,
+        workerId: worker.id,
+        workerName: worker.name,
+        workerRole: worker.role,
+        workDate: cleanDate,
+        location: cleanLocation,
+        content: cleanContent,
+        status: cleanStatus,
+        photoUrl,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          `INSERT INTO work_logs (id, apartment_id, worker_id, worker_name, worker_role, work_date, location, content, status, photo_url, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          [
+            newLog.id,
+            newLog.apartmentId,
+            newLog.workerId,
+            newLog.workerName,
+            newLog.workerRole,
+            newLog.workDate,
+            newLog.location,
+            newLog.content,
+            newLog.status,
+            newLog.photoUrl,
+            newLog.createdAt,
+            newLog.updatedAt,
+          ]
+        );
+      } else {
+        const store = readStore();
+        store.logs.unshift(newLog);
+        writeStore(store);
+      }
+
+      res.status(201).json({ log: newLog });
+    })
+  );
+
+  app.patch(
+    '/api/logs/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+      const {
+        actingWorkerId,
+        workDate,
+        location,
+        content,
+        status,
+        photoBase64,
+        removePhoto,
+      } = req.body as {
         actingWorkerId?: string;
         workDate?: string;
         location?: string;
@@ -992,590 +1925,1293 @@ async function startServer() {
         removePhoto?: boolean;
       };
 
-    const store = readStore();
-    const idx = store.logs.findIndex(
-      (l) => l.id === id && l.apartmentId === apartmentId
-    );
-    if (idx === -1) {
-      res.status(404).json({ error: '해당 작업일지를 찾을 수 없습니다.' });
-      return;
-    }
+      let existing: WorkLogRecord | undefined;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const found = await getPgPool().query(
+          'SELECT * FROM work_logs WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [id, apartmentId]
+        );
+        existing = found.rows[0] ? mapLogRow(found.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        existing = store.logs.find(
+          (l) => l.id === id && l.apartmentId === apartmentId
+        );
+      }
 
-    const existing = store.logs[idx];
-    const isAdmin = Boolean(req.session?.isAdmin);
-    const isOwner = Boolean(actingWorkerId && existing.workerId === actingWorkerId);
+      if (!existing) {
+        res.status(404).json({ error: '해당 작업일지를 찾을 수 없습니다.' });
+        return;
+      }
 
-    if (!isAdmin && !isOwner) {
-      res.status(403).json({
-        error: '본인이 작성한 작업일지만 수정할 수 있습니다. 타인의 기록 수정은 관리자 인증이 필요합니다.',
-      });
-      return;
-    }
+      const isAdmin = Boolean(req.session?.isAdmin);
+      const isOwner = Boolean(
+        actingWorkerId && existing.workerId === actingWorkerId
+      );
 
-    const cleanDate = (workDate ?? existing.workDate).trim();
-    const cleanLocation = (location ?? existing.location).trim();
-    const cleanContent = (content ?? existing.content).trim();
-    const cleanStatus: WorkStatus =
-      status === 'pending' || status === 'in_progress' || status === 'completed'
-        ? status
-        : existing.status || 'completed';
-
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanDate) || !cleanLocation || !cleanContent) {
-      res.status(400).json({ error: '작업 날짜, 작업 장소, 처리 내용을 모두 입력해 주세요.' });
-      return;
-    }
-
-    let nextPhotoUrl = existing.photoUrl;
-    if (removePhoto) {
-      deleteUploadedPhotoIfLocal(existing.photoUrl);
-      nextPhotoUrl = null;
-    } else if (photoBase64 && typeof photoBase64 === 'string') {
-      try {
-        const saved = saveBase64Photo(photoBase64);
-        if (saved) {
-          deleteUploadedPhotoIfLocal(existing.photoUrl);
-          nextPhotoUrl = saved;
-        }
-      } catch (err) {
-        res.status(400).json({
-          error: err instanceof Error ? err.message : '사진 업로드에 실패했습니다.',
+      if (!isAdmin && !isOwner) {
+        res.status(403).json({
+          error:
+            '본인이 작성한 작업일지만 수정할 수 있습니다. 타인의 기록 수정은 관리자 인증이 필요합니다.',
         });
         return;
       }
-    }
 
-    const updated: WorkLogRecord = {
-      ...existing,
-      workDate: cleanDate,
-      location: cleanLocation,
-      content: cleanContent,
-      status: cleanStatus,
-      photoUrl: nextPhotoUrl,
-      updatedAt: new Date().toISOString(),
-    };
+      const cleanDate = (workDate ?? existing.workDate).trim();
+      const cleanLocation = (location ?? existing.location).trim();
+      const cleanContent = (content ?? existing.content).trim();
+      const cleanStatus: WorkStatus =
+        status === 'pending' ||
+        status === 'in_progress' ||
+        status === 'completed'
+          ? status
+          : existing.status || 'completed';
 
-    store.logs[idx] = updated;
-    writeStore(store);
-    res.json({ log: updated });
-  });
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(cleanDate) ||
+        !cleanLocation ||
+        !cleanContent
+      ) {
+        res.status(400).json({
+          error: '작업 날짜, 작업 장소, 처리 내용을 모두 입력해 주세요.',
+        });
+        return;
+      }
 
-  app.delete('/api/logs/:id', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const store = readStore();
-    const target = store.logs.find(
-      (l) => l.id === id && l.apartmentId === apartmentId
-    );
-    if (!target) {
-      res.status(404).json({ error: '해당 작업일지를 찾을 수 없습니다.' });
-      return;
-    }
-    deleteUploadedPhotoIfLocal(target.photoUrl);
-    store.logs = store.logs.filter(
-      (l) => !(l.id === id && l.apartmentId === apartmentId)
-    );
-    writeStore(store);
-    res.json({ ok: true });
-  });
-
-  // Notices (scoped to apartment)
-  app.get('/api/notices', requireAuth, (req: AuthedRequest, res: Response) => {
-    const store = readStore();
-    const notices = store.notices
-      .filter((n) => n.apartmentId === req.session!.apartmentId)
-      .sort((a, b) => {
-        if (a.isPinned !== b.isPinned) {
-          return a.isPinned ? -1 : 1;
+      let nextPhotoUrl = existing.photoUrl;
+      if (removePhoto) {
+        deleteUploadedPhotoIfLocal(existing.photoUrl);
+        nextPhotoUrl = null;
+      } else if (photoBase64 && typeof photoBase64 === 'string') {
+        try {
+          const saved = saveBase64Photo(photoBase64);
+          if (saved) {
+            deleteUploadedPhotoIfLocal(existing.photoUrl);
+            nextPhotoUrl = saved;
+          }
+        } catch (err) {
+          res.status(400).json({
+            error:
+              err instanceof Error
+                ? err.message
+                : '사진 업로드에 실패했습니다.',
+          });
+          return;
         }
-        return b.createdAt.localeCompare(a.createdAt);
-      });
-    res.json({ notices });
-  });
+      }
 
-  app.post('/api/notices', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { title, content, isPinned, authorName } = req.body as {
-      title?: string;
-      content?: string;
-      isPinned?: boolean;
-      authorName?: string;
-    };
-    const cleanTitle = (title || '').trim();
-    const cleanContent = (content || '').trim();
-    if (!cleanTitle || !cleanContent) {
-      res.status(400).json({ error: '공지 제목과 내용을 모두 입력해 주세요.' });
-      return;
-    }
+      const updated: WorkLogRecord = {
+        ...existing,
+        workDate: cleanDate,
+        location: cleanLocation,
+        content: cleanContent,
+        status: cleanStatus,
+        photoUrl: nextPhotoUrl,
+        updatedAt: new Date().toISOString(),
+      };
 
-    const store = readStore();
-    const nowIso = new Date().toISOString();
-    const notice: NoticeRecord = {
-      id: `notice-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
-      apartmentId: req.session!.apartmentId,
-      title: cleanTitle,
-      content: cleanContent,
-      isPinned: Boolean(isPinned),
-      authorName: (authorName || '').trim() || '관리사무소',
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-    store.notices.unshift(notice);
-    writeStore(store);
-    res.status(201).json({ notice });
-  });
-
-  app.patch('/api/notices/:id', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const { title, content, isPinned } = req.body as {
-      title?: string;
-      content?: string;
-      isPinned?: boolean;
-    };
-    const store = readStore();
-    const idx = store.notices.findIndex(
-      (n) => n.id === id && n.apartmentId === apartmentId
-    );
-    if (idx === -1) {
-      res.status(404).json({ error: '해당 공지사항을 찾을 수 없습니다.' });
-      return;
-    }
-
-    const existing = store.notices[idx];
-    const cleanTitle = (title ?? existing.title).trim();
-    const cleanContent = (content ?? existing.content).trim();
-    if (!cleanTitle || !cleanContent) {
-      res.status(400).json({ error: '공지 제목과 내용을 모두 입력해 주세요.' });
-      return;
-    }
-
-    const updated: NoticeRecord = {
-      ...existing,
-      title: cleanTitle,
-      content: cleanContent,
-      isPinned: typeof isPinned === 'boolean' ? isPinned : existing.isPinned,
-      updatedAt: new Date().toISOString(),
-    };
-    store.notices[idx] = updated;
-    writeStore(store);
-    res.json({ notice: updated });
-  });
-
-  app.delete('/api/notices/:id', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const store = readStore();
-    if (!store.notices.some((n) => n.id === id && n.apartmentId === apartmentId)) {
-      res.status(404).json({ error: '해당 공지사항을 찾을 수 없습니다.' });
-      return;
-    }
-    store.notices = store.notices.filter(
-      (n) => !(n.id === id && n.apartmentId === apartmentId)
-    );
-    writeStore(store);
-    res.json({ ok: true });
-  });
-
-  // Handovers (scoped to apartment)
-  app.get('/api/handovers', requireAuth, (req: AuthedRequest, res: Response) => {
-    const store = readStore();
-    const handovers = store.handovers
-      .filter((h) => h.apartmentId === req.session!.apartmentId)
-      .sort((a, b) => {
-        if (a.status !== b.status) {
-          return a.status === 'pending' ? -1 : 1;
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          `UPDATE work_logs
+           SET work_date = $1, location = $2, content = $3, status = $4, photo_url = $5, updated_at = $6
+           WHERE id = $7 AND apartment_id = $8`,
+          [
+            updated.workDate,
+            updated.location,
+            updated.content,
+            updated.status,
+            updated.photoUrl,
+            updated.updatedAt,
+            id,
+            apartmentId,
+          ]
+        );
+      } else {
+        const store = readStore();
+        const idx = store.logs.findIndex(
+          (l) => l.id === id && l.apartmentId === apartmentId
+        );
+        if (idx !== -1) {
+          store.logs[idx] = updated;
+          writeStore(store);
         }
-        return b.createdAt.localeCompare(a.createdAt);
-      });
-    res.json({ handovers });
-  });
+      }
 
-  app.post('/api/handovers', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { workerId, targetShift, content } = req.body as {
-      workerId?: string;
-      targetShift?: string;
-      content?: string;
-    };
-    const apartmentId = req.session!.apartmentId;
-    const store = readStore();
-    const worker = store.workers.find(
-      (w) => w.id === workerId && w.apartmentId === apartmentId
-    );
-    if (!worker) {
-      res.status(400).json({ error: '작성자(직원 이름)를 먼저 선택해 주세요.' });
-      return;
-    }
-    const cleanContent = (content || '').trim();
-    const cleanShift = (targetShift || '').trim() || '주간/익일';
-    if (!cleanContent) {
-      res.status(400).json({ error: '인수인계 내용을 입력해 주세요.' });
-      return;
-    }
+      res.json({ log: updated });
+    })
+  );
 
-    const nowIso = new Date().toISOString();
-    const handover: HandoverRecord = {
-      id: `handover-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
-      apartmentId,
-      workerId: worker.id,
-      workerName: worker.name,
-      workerRole: worker.role,
-      targetShift: cleanShift,
-      content: cleanContent,
-      status: 'pending',
-      completedBy: null,
-      completedAt: null,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-    store.handovers.unshift(handover);
-    writeStore(store);
-    res.status(201).json({ handover });
-  });
+  app.delete(
+    '/api/logs/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
 
-  app.patch('/api/handovers/:id/status', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const { status, actingWorkerId } = req.body as {
-      status?: 'pending' | 'completed';
-      actingWorkerId?: string;
-    };
-    const store = readStore();
-    const idx = store.handovers.findIndex(
-      (h) => h.id === id && h.apartmentId === apartmentId
-    );
-    if (idx === -1) {
-      res.status(404).json({ error: '해당 인수인계 항목을 찾을 수 없습니다.' });
-      return;
-    }
-
-    const worker = store.workers.find(
-      (w) => w.id === actingWorkerId && w.apartmentId === apartmentId
-    );
-    const actorName = worker?.name || (req.session?.isAdmin ? '관리자' : '');
-    if (!actorName) {
-      res.status(400).json({ error: '인계 확인을 하려면 먼저 작업자 이름을 선택해 주세요.' });
-      return;
-    }
-
-    const nextStatus = status === 'completed' ? 'completed' : 'pending';
-    const nowIso = new Date().toISOString();
-    const updated: HandoverRecord = {
-      ...store.handovers[idx],
-      status: nextStatus,
-      completedBy: nextStatus === 'completed' ? actorName : null,
-      completedAt: nextStatus === 'completed' ? nowIso : null,
-      updatedAt: nowIso,
-    };
-    store.handovers[idx] = updated;
-    writeStore(store);
-    res.json({ handover: updated });
-  });
-
-  app.patch('/api/handovers/:id', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const { actingWorkerId, targetShift, content } = req.body as {
-      actingWorkerId?: string;
-      targetShift?: string;
-      content?: string;
-    };
-    const store = readStore();
-    const idx = store.handovers.findIndex(
-      (h) => h.id === id && h.apartmentId === apartmentId
-    );
-    if (idx === -1) {
-      res.status(404).json({ error: '해당 인수인계 항목을 찾을 수 없습니다.' });
-      return;
-    }
-    const existing = store.handovers[idx];
-    const isAdmin = Boolean(req.session?.isAdmin);
-    const isOwner = Boolean(actingWorkerId && existing.workerId === actingWorkerId);
-    if (!isAdmin && !isOwner) {
-      res.status(403).json({ error: '본인이 작성한 인수인계만 수정할 수 있습니다.' });
-      return;
-    }
-
-    const cleanContent = (content ?? existing.content).trim();
-    const cleanShift =
-      (targetShift ?? existing.targetShift).trim() || existing.targetShift;
-    if (!cleanContent) {
-      res.status(400).json({ error: '인수인계 내용을 입력해 주세요.' });
-      return;
-    }
-
-    const updated: HandoverRecord = {
-      ...existing,
-      targetShift: cleanShift,
-      content: cleanContent,
-      updatedAt: new Date().toISOString(),
-    };
-    store.handovers[idx] = updated;
-    writeStore(store);
-    res.json({ handover: updated });
-  });
-
-  app.delete('/api/handovers/:id', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const { actingWorkerId } = req.body as { actingWorkerId?: string };
-    const store = readStore();
-    const existing = store.handovers.find(
-      (h) => h.id === id && h.apartmentId === apartmentId
-    );
-    if (!existing) {
-      res.status(404).json({ error: '해당 인수인계 항목을 찾을 수 없습니다.' });
-      return;
-    }
-    const isAdmin = Boolean(req.session?.isAdmin);
-    const isOwner = Boolean(actingWorkerId && existing.workerId === actingWorkerId);
-    if (!isAdmin && !isOwner) {
-      res.status(403).json({ error: '본인이 작성한 인수인계만 삭제할 수 있습니다.' });
-      return;
-    }
-    store.handovers = store.handovers.filter(
-      (h) => !(h.id === id && h.apartmentId === apartmentId)
-    );
-    writeStore(store);
-    res.json({ ok: true });
-  });
-
-  // Event Banners (scoped to apartment)
-  app.get('/api/banners', requireAuth, (req: AuthedRequest, res: Response) => {
-    const store = readStore();
-    const banners = (store.banners || [])
-      .filter((b) => b.apartmentId === req.session!.apartmentId)
-      .sort((a, b) => {
-        if (a.isActive !== b.isActive) {
-          return a.isActive ? -1 : 1;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const delRes = await getPgPool().query(
+          'DELETE FROM work_logs WHERE id = $1 AND apartment_id = $2 RETURNING photo_url',
+          [id, apartmentId]
+        );
+        if (delRes.rows.length === 0) {
+          res.status(404).json({ error: '해당 작업일지를 찾을 수 없습니다.' });
+          return;
         }
-        return b.updatedAt.localeCompare(a.updatedAt);
-      });
-    res.json({ banners });
-  });
+        deleteUploadedPhotoIfLocal(
+          delRes.rows[0].photo_url ? String(delRes.rows[0].photo_url) : null
+        );
+        res.json({ ok: true });
+        return;
+      }
 
-  app.post('/api/banners', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const {
-      category,
-      title,
-      subtitle,
-      eventDate,
-      eventLocation,
-      contactInfo,
-      isActive,
-    } = req.body as {
-      category?: BannerCategory;
-      title?: string;
-      subtitle?: string;
-      eventDate?: string;
-      eventLocation?: string;
-      contactInfo?: string;
-      isActive?: boolean;
-    };
+      const store = readStore();
+      const target = store.logs.find(
+        (l) => l.id === id && l.apartmentId === apartmentId
+      );
+      if (!target) {
+        res.status(404).json({ error: '해당 작업일지를 찾을 수 없습니다.' });
+        return;
+      }
+      deleteUploadedPhotoIfLocal(target.photoUrl);
+      store.logs = store.logs.filter(
+        (l) => !(l.id === id && l.apartmentId === apartmentId)
+      );
+      writeStore(store);
+      res.json({ ok: true });
+    })
+  );
 
-    const cleanTitle = (title || '').trim();
-    if (!cleanTitle) {
-      res.status(400).json({ error: '배너 제목을 입력해 주세요.' });
-      return;
-    }
+  // Notices
+  app.get(
+    '/api/notices',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = await getPgPool().query(
+          'SELECT * FROM notices WHERE apartment_id = $1 ORDER BY is_pinned DESC, created_at DESC',
+          [apartmentId]
+        );
+        res.json({ notices: result.rows.map(mapNoticeRow) });
+        return;
+      }
 
-    const validCategories: BannerCategory[] = [
-      'wedding',
-      'funeral',
-      'celebration',
-      'notice',
-    ];
-    const cleanCategory: BannerCategory = validCategories.includes(
-      category as BannerCategory
-    )
-      ? (category as BannerCategory)
-      : 'notice';
+      const store = readStore();
+      const notices = store.notices
+        .filter((n) => n.apartmentId === apartmentId)
+        .sort((a, b) => {
+          if (a.isPinned !== b.isPinned) {
+            return a.isPinned ? -1 : 1;
+          }
+          return b.createdAt.localeCompare(a.createdAt);
+        });
+      res.json({ notices });
+    })
+  );
 
-    const store = readStore();
-    if (!Array.isArray(store.banners)) store.banners = [];
+  app.post(
+    '/api/notices',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { title, content, isPinned, authorName } = req.body as {
+        title?: string;
+        content?: string;
+        isPinned?: boolean;
+        authorName?: string;
+      };
+      const cleanTitle = (title || '').trim();
+      const cleanContent = (content || '').trim();
+      if (!cleanTitle || !cleanContent) {
+        res
+          .status(400)
+          .json({ error: '공지 제목과 내용을 모두 입력해 주세요.' });
+        return;
+      }
 
-    const nowIso = new Date().toISOString();
-    const banner: EventBannerRecord = {
-      id: `banner-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
-      apartmentId: req.session!.apartmentId,
-      category: cleanCategory,
-      title: cleanTitle.slice(0, 80),
-      subtitle: (subtitle || '').trim().slice(0, 120),
-      eventDate: (eventDate || '').trim().slice(0, 60),
-      eventLocation: (eventLocation || '').trim().slice(0, 80),
-      contactInfo: (contactInfo || '').trim().slice(0, 80),
-      isActive: isActive !== false,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
+      const nowIso = new Date().toISOString();
+      const notice: NoticeRecord = {
+        id: `notice-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+        apartmentId: req.session!.apartmentId,
+        title: cleanTitle,
+        content: cleanContent,
+        isPinned: Boolean(isPinned),
+        authorName: (authorName || '').trim() || '관리사무소',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
 
-    store.banners.unshift(banner);
-    writeStore(store);
-    res.status(201).json({ banner });
-  });
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        await getPgPool().query(
+          `INSERT INTO notices (id, apartment_id, title, content, is_pinned, author_name, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            notice.id,
+            notice.apartmentId,
+            notice.title,
+            notice.content,
+            notice.isPinned,
+            notice.authorName,
+            notice.createdAt,
+            notice.updatedAt,
+          ]
+        );
+      } else {
+        const store = readStore();
+        store.notices.unshift(notice);
+        writeStore(store);
+      }
 
-  app.patch('/api/banners/:id', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const {
-      category,
-      title,
-      subtitle,
-      eventDate,
-      eventLocation,
-      contactInfo,
-      isActive,
-    } = req.body as {
-      category?: BannerCategory;
-      title?: string;
-      subtitle?: string;
-      eventDate?: string;
-      eventLocation?: string;
-      contactInfo?: string;
-      isActive?: boolean;
-    };
+      res.status(201).json({ notice });
+    })
+  );
 
-    const store = readStore();
-    if (!Array.isArray(store.banners)) store.banners = [];
+  app.patch(
+    '/api/notices/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+      const { title, content, isPinned } = req.body as {
+        title?: string;
+        content?: string;
+        isPinned?: boolean;
+      };
 
-    const idx = store.banners.findIndex(
-      (b) => b.id === id && b.apartmentId === apartmentId
-    );
-    if (idx === -1) {
-      res.status(404).json({ error: '해당 배너를 찾을 수 없습니다.' });
-      return;
-    }
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const found = await pool.query(
+          'SELECT * FROM notices WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [id, apartmentId]
+        );
+        if (found.rows.length === 0) {
+          res.status(404).json({ error: '해당 공지사항을 찾을 수 없습니다.' });
+          return;
+        }
+        const existing = mapNoticeRow(found.rows[0]);
+        const cleanTitle = (title ?? existing.title).trim();
+        const cleanContent = (content ?? existing.content).trim();
+        if (!cleanTitle || !cleanContent) {
+          res
+            .status(400)
+            .json({ error: '공지 제목과 내용을 모두 입력해 주세요.' });
+          return;
+        }
+        const updated: NoticeRecord = {
+          ...existing,
+          title: cleanTitle,
+          content: cleanContent,
+          isPinned: typeof isPinned === 'boolean' ? isPinned : existing.isPinned,
+          updatedAt: new Date().toISOString(),
+        };
+        await pool.query(
+          'UPDATE notices SET title = $1, content = $2, is_pinned = $3, updated_at = $4 WHERE id = $5 AND apartment_id = $6',
+          [
+            updated.title,
+            updated.content,
+            updated.isPinned,
+            updated.updatedAt,
+            id,
+            apartmentId,
+          ]
+        );
+        res.json({ notice: updated });
+        return;
+      }
 
-    const existing = store.banners[idx];
-    const cleanTitle = (title ?? existing.title).trim();
-    if (!cleanTitle) {
-      res.status(400).json({ error: '배너 제목을 입력해 주세요.' });
-      return;
-    }
+      const store = readStore();
+      const idx = store.notices.findIndex(
+        (n) => n.id === id && n.apartmentId === apartmentId
+      );
+      if (idx === -1) {
+        res.status(404).json({ error: '해당 공지사항을 찾을 수 없습니다.' });
+        return;
+      }
 
-    const validCategories: BannerCategory[] = [
-      'wedding',
-      'funeral',
-      'celebration',
-      'notice',
-    ];
-    const cleanCategory: BannerCategory =
-      category && validCategories.includes(category)
-        ? category
-        : existing.category;
+      const existing = store.notices[idx];
+      const cleanTitle = (title ?? existing.title).trim();
+      const cleanContent = (content ?? existing.content).trim();
+      if (!cleanTitle || !cleanContent) {
+        res
+          .status(400)
+          .json({ error: '공지 제목과 내용을 모두 입력해 주세요.' });
+        return;
+      }
 
-    const updated: EventBannerRecord = {
-      ...existing,
-      category: cleanCategory,
-      title: cleanTitle.slice(0, 80),
-      subtitle: (subtitle ?? existing.subtitle).trim().slice(0, 120),
-      eventDate: (eventDate ?? existing.eventDate).trim().slice(0, 60),
-      eventLocation: (eventLocation ?? existing.eventLocation).trim().slice(0, 80),
-      contactInfo: (contactInfo ?? existing.contactInfo).trim().slice(0, 80),
-      isActive: typeof isActive === 'boolean' ? isActive : existing.isActive,
-      updatedAt: new Date().toISOString(),
-    };
+      const updated: NoticeRecord = {
+        ...existing,
+        title: cleanTitle,
+        content: cleanContent,
+        isPinned: typeof isPinned === 'boolean' ? isPinned : existing.isPinned,
+        updatedAt: new Date().toISOString(),
+      };
+      store.notices[idx] = updated;
+      writeStore(store);
+      res.json({ notice: updated });
+    })
+  );
 
-    store.banners[idx] = updated;
-    writeStore(store);
-    res.json({ banner: updated });
-  });
+  app.delete(
+    '/api/notices/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
 
-  app.delete('/api/banners/:id', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
-    const { id } = req.params;
-    const apartmentId = req.session!.apartmentId;
-    const store = readStore();
-    if (!Array.isArray(store.banners)) store.banners = [];
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const del = await getPgPool().query(
+          'DELETE FROM notices WHERE id = $1 AND apartment_id = $2 RETURNING id',
+          [id, apartmentId]
+        );
+        if (del.rows.length === 0) {
+          res.status(404).json({ error: '해당 공지사항을 찾을 수 없습니다.' });
+          return;
+        }
+        res.json({ ok: true });
+        return;
+      }
 
-    if (!store.banners.some((b) => b.id === id && b.apartmentId === apartmentId)) {
-      res.status(404).json({ error: '해당 배너를 찾을 수 없습니다.' });
-      return;
-    }
+      const store = readStore();
+      if (
+        !store.notices.some((n) => n.id === id && n.apartmentId === apartmentId)
+      ) {
+        res.status(404).json({ error: '해당 공지사항을 찾을 수 없습니다.' });
+        return;
+      }
+      store.notices = store.notices.filter(
+        (n) => !(n.id === id && n.apartmentId === apartmentId)
+      );
+      writeStore(store);
+      res.json({ ok: true });
+    })
+  );
 
-    store.banners = store.banners.filter(
-      (b) => !(b.id === id && b.apartmentId === apartmentId)
-    );
-    writeStore(store);
-    res.json({ ok: true });
-  });
+  // Handovers
+  app.get(
+    '/api/handovers',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = await getPgPool().query(
+          `SELECT * FROM handovers WHERE apartment_id = $1
+           ORDER BY (CASE WHEN status = 'pending' THEN 0 ELSE 1 END) ASC, created_at DESC`,
+          [apartmentId]
+        );
+        res.json({ handovers: result.rows.map(mapHandoverRow) });
+        return;
+      }
 
-  // Update Passwords (Admin only, scoped to current apartment)
+      const store = readStore();
+      const handovers = store.handovers
+        .filter((h) => h.apartmentId === apartmentId)
+        .sort((a, b) => {
+          if (a.status !== b.status) {
+            return a.status === 'pending' ? -1 : 1;
+          }
+          return b.createdAt.localeCompare(a.createdAt);
+        });
+      res.json({ handovers });
+    })
+  );
+
+  app.post(
+    '/api/handovers',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { workerId, targetShift, content } = req.body as {
+        workerId?: string;
+        targetShift?: string;
+        content?: string;
+      };
+      const apartmentId = req.session!.apartmentId;
+
+      let worker: WorkerRecord | undefined;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const wRes = await getPgPool().query(
+          'SELECT * FROM workers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [workerId || '', apartmentId]
+        );
+        worker = wRes.rows[0] ? mapWorkerRow(wRes.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        worker = store.workers.find(
+          (w) => w.id === workerId && w.apartmentId === apartmentId
+        );
+      }
+
+      if (!worker) {
+        res
+          .status(400)
+          .json({ error: '작성자(직원 이름)를 먼저 선택해 주세요.' });
+        return;
+      }
+      const cleanContent = (content || '').trim();
+      const cleanShift = (targetShift || '').trim() || '주간/익일';
+      if (!cleanContent) {
+        res.status(400).json({ error: '인수인계 내용을 입력해 주세요.' });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const handover: HandoverRecord = {
+        id: `handover-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+        apartmentId,
+        workerId: worker.id,
+        workerName: worker.name,
+        workerRole: worker.role,
+        targetShift: cleanShift,
+        content: cleanContent,
+        status: 'pending',
+        completedBy: null,
+        completedAt: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          `INSERT INTO handovers (id, apartment_id, worker_id, worker_name, worker_role, target_shift, content, status, completed_by, completed_at, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          [
+            handover.id,
+            handover.apartmentId,
+            handover.workerId,
+            handover.workerName,
+            handover.workerRole,
+            handover.targetShift,
+            handover.content,
+            handover.status,
+            handover.completedBy,
+            handover.completedAt,
+            handover.createdAt,
+            handover.updatedAt,
+          ]
+        );
+      } else {
+        const store = readStore();
+        store.handovers.unshift(handover);
+        writeStore(store);
+      }
+
+      res.status(201).json({ handover });
+    })
+  );
+
+  app.patch(
+    '/api/handovers/:id/status',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+      const { status, actingWorkerId } = req.body as {
+        status?: 'pending' | 'completed';
+        actingWorkerId?: string;
+      };
+
+      let existing: HandoverRecord | undefined;
+      let actorName = '';
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const found = await pool.query(
+          'SELECT * FROM handovers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [id, apartmentId]
+        );
+        existing = found.rows[0] ? mapHandoverRow(found.rows[0]) : undefined;
+        if (existing) {
+          const wRes = await pool.query(
+            'SELECT name FROM workers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+            [actingWorkerId || '', apartmentId]
+          );
+          actorName = wRes.rows[0]
+            ? String(wRes.rows[0].name)
+            : req.session?.isAdmin
+              ? '관리자'
+              : '';
+        }
+      } else {
+        const store = readStore();
+        existing = store.handovers.find(
+          (h) => h.id === id && h.apartmentId === apartmentId
+        );
+        if (existing) {
+          const worker = store.workers.find(
+            (w) => w.id === actingWorkerId && w.apartmentId === apartmentId
+          );
+          actorName = worker?.name || (req.session?.isAdmin ? '관리자' : '');
+        }
+      }
+
+      if (!existing) {
+        res
+          .status(404)
+          .json({ error: '해당 인수인계 항목을 찾을 수 없습니다.' });
+        return;
+      }
+      if (!actorName) {
+        res.status(400).json({
+          error: '인계 확인을 하려면 먼저 작업자 이름을 선택해 주세요.',
+        });
+        return;
+      }
+
+      const nextStatus = status === 'completed' ? 'completed' : 'pending';
+      const nowIso = new Date().toISOString();
+      const updated: HandoverRecord = {
+        ...existing,
+        status: nextStatus,
+        completedBy: nextStatus === 'completed' ? actorName : null,
+        completedAt: nextStatus === 'completed' ? nowIso : null,
+        updatedAt: nowIso,
+      };
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          'UPDATE handovers SET status = $1, completed_by = $2, completed_at = $3, updated_at = $4 WHERE id = $5 AND apartment_id = $6',
+          [
+            updated.status,
+            updated.completedBy,
+            updated.completedAt,
+            updated.updatedAt,
+            id,
+            apartmentId,
+          ]
+        );
+      } else {
+        const store = readStore();
+        const idx = store.handovers.findIndex(
+          (h) => h.id === id && h.apartmentId === apartmentId
+        );
+        if (idx !== -1) {
+          store.handovers[idx] = updated;
+          writeStore(store);
+        }
+      }
+
+      res.json({ handover: updated });
+    })
+  );
+
+  app.patch(
+    '/api/handovers/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+      const { actingWorkerId, targetShift, content } = req.body as {
+        actingWorkerId?: string;
+        targetShift?: string;
+        content?: string;
+      };
+
+      let existing: HandoverRecord | undefined;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const found = await getPgPool().query(
+          'SELECT * FROM handovers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [id, apartmentId]
+        );
+        existing = found.rows[0] ? mapHandoverRow(found.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        existing = store.handovers.find(
+          (h) => h.id === id && h.apartmentId === apartmentId
+        );
+      }
+
+      if (!existing) {
+        res
+          .status(404)
+          .json({ error: '해당 인수인계 항목을 찾을 수 없습니다.' });
+        return;
+      }
+
+      const isAdmin = Boolean(req.session?.isAdmin);
+      const isOwner = Boolean(
+        actingWorkerId && existing.workerId === actingWorkerId
+      );
+      if (!isAdmin && !isOwner) {
+        res
+          .status(403)
+          .json({ error: '본인이 작성한 인수인계만 수정할 수 있습니다.' });
+        return;
+      }
+
+      const cleanContent = (content ?? existing.content).trim();
+      const cleanShift =
+        (targetShift ?? existing.targetShift).trim() || existing.targetShift;
+      if (!cleanContent) {
+        res.status(400).json({ error: '인수인계 내용을 입력해 주세요.' });
+        return;
+      }
+
+      const updated: HandoverRecord = {
+        ...existing,
+        targetShift: cleanShift,
+        content: cleanContent,
+        updatedAt: new Date().toISOString(),
+      };
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          'UPDATE handovers SET target_shift = $1, content = $2, updated_at = $3 WHERE id = $4 AND apartment_id = $5',
+          [
+            updated.targetShift,
+            updated.content,
+            updated.updatedAt,
+            id,
+            apartmentId,
+          ]
+        );
+      } else {
+        const store = readStore();
+        const idx = store.handovers.findIndex(
+          (h) => h.id === id && h.apartmentId === apartmentId
+        );
+        if (idx !== -1) {
+          store.handovers[idx] = updated;
+          writeStore(store);
+        }
+      }
+
+      res.json({ handover: updated });
+    })
+  );
+
+  app.delete(
+    '/api/handovers/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+      const { actingWorkerId } = req.body as { actingWorkerId?: string };
+
+      let existing: HandoverRecord | undefined;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const found = await getPgPool().query(
+          'SELECT * FROM handovers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [id, apartmentId]
+        );
+        existing = found.rows[0] ? mapHandoverRow(found.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        existing = store.handovers.find(
+          (h) => h.id === id && h.apartmentId === apartmentId
+        );
+      }
+
+      if (!existing) {
+        res
+          .status(404)
+          .json({ error: '해당 인수인계 항목을 찾을 수 없습니다.' });
+        return;
+      }
+      const isAdmin = Boolean(req.session?.isAdmin);
+      const isOwner = Boolean(
+        actingWorkerId && existing.workerId === actingWorkerId
+      );
+      if (!isAdmin && !isOwner) {
+        res
+          .status(403)
+          .json({ error: '본인이 작성한 인수인계만 삭제할 수 있습니다.' });
+        return;
+      }
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          'DELETE FROM handovers WHERE id = $1 AND apartment_id = $2',
+          [id, apartmentId]
+        );
+      } else {
+        const store = readStore();
+        store.handovers = store.handovers.filter(
+          (h) => !(h.id === id && h.apartmentId === apartmentId)
+        );
+        writeStore(store);
+      }
+      res.json({ ok: true });
+    })
+  );
+
+  // Event Banners
+  app.get(
+    '/api/banners',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = await getPgPool().query(
+          'SELECT * FROM event_banners WHERE apartment_id = $1 ORDER BY is_active DESC, updated_at DESC',
+          [apartmentId]
+        );
+        res.json({ banners: result.rows.map(mapBannerRow) });
+        return;
+      }
+
+      const store = readStore();
+      const banners = (store.banners || [])
+        .filter((b) => b.apartmentId === apartmentId)
+        .sort((a, b) => {
+          if (a.isActive !== b.isActive) {
+            return a.isActive ? -1 : 1;
+          }
+          return b.updatedAt.localeCompare(a.updatedAt);
+        });
+      res.json({ banners });
+    })
+  );
+
+  app.post(
+    '/api/banners',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const {
+        category,
+        title,
+        subtitle,
+        eventDate,
+        eventLocation,
+        contactInfo,
+        isActive,
+      } = req.body as {
+        category?: BannerCategory;
+        title?: string;
+        subtitle?: string;
+        eventDate?: string;
+        eventLocation?: string;
+        contactInfo?: string;
+        isActive?: boolean;
+      };
+
+      const cleanTitle = (title || '').trim();
+      if (!cleanTitle) {
+        res.status(400).json({ error: '배너 제목을 입력해 주세요.' });
+        return;
+      }
+
+      const validCategories: BannerCategory[] = [
+        'wedding',
+        'funeral',
+        'celebration',
+        'notice',
+      ];
+      const cleanCategory: BannerCategory = validCategories.includes(
+        category as BannerCategory
+      )
+        ? (category as BannerCategory)
+        : 'notice';
+
+      const nowIso = new Date().toISOString();
+      const banner: EventBannerRecord = {
+        id: `banner-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+        apartmentId: req.session!.apartmentId,
+        category: cleanCategory,
+        title: cleanTitle.slice(0, 80),
+        subtitle: (subtitle || '').trim().slice(0, 120),
+        eventDate: (eventDate || '').trim().slice(0, 60),
+        eventLocation: (eventLocation || '').trim().slice(0, 80),
+        contactInfo: (contactInfo || '').trim().slice(0, 80),
+        isActive: isActive !== false,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        await getPgPool().query(
+          `INSERT INTO event_banners (id, apartment_id, category, title, subtitle, event_date, event_location, contact_info, is_active, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [
+            banner.id,
+            banner.apartmentId,
+            banner.category,
+            banner.title,
+            banner.subtitle,
+            banner.eventDate,
+            banner.eventLocation,
+            banner.contactInfo,
+            banner.isActive,
+            banner.createdAt,
+            banner.updatedAt,
+          ]
+        );
+      } else {
+        const store = readStore();
+        if (!Array.isArray(store.banners)) store.banners = [];
+        store.banners.unshift(banner);
+        writeStore(store);
+      }
+
+      res.status(201).json({ banner });
+    })
+  );
+
+  app.patch(
+    '/api/banners/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+      const {
+        category,
+        title,
+        subtitle,
+        eventDate,
+        eventLocation,
+        contactInfo,
+        isActive,
+      } = req.body as {
+        category?: BannerCategory;
+        title?: string;
+        subtitle?: string;
+        eventDate?: string;
+        eventLocation?: string;
+        contactInfo?: string;
+        isActive?: boolean;
+      };
+
+      let existing: EventBannerRecord | undefined;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const found = await getPgPool().query(
+          'SELECT * FROM event_banners WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [id, apartmentId]
+        );
+        existing = found.rows[0] ? mapBannerRow(found.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        existing = (store.banners || []).find(
+          (b) => b.id === id && b.apartmentId === apartmentId
+        );
+      }
+
+      if (!existing) {
+        res.status(404).json({ error: '해당 배너를 찾을 수 없습니다.' });
+        return;
+      }
+
+      const cleanTitle = (title ?? existing.title).trim();
+      if (!cleanTitle) {
+        res.status(400).json({ error: '배너 제목을 입력해 주세요.' });
+        return;
+      }
+
+      const validCategories: BannerCategory[] = [
+        'wedding',
+        'funeral',
+        'celebration',
+        'notice',
+      ];
+      const cleanCategory: BannerCategory =
+        category && validCategories.includes(category)
+          ? category
+          : existing.category;
+
+      const updated: EventBannerRecord = {
+        ...existing,
+        category: cleanCategory,
+        title: cleanTitle.slice(0, 80),
+        subtitle: (subtitle ?? existing.subtitle).trim().slice(0, 120),
+        eventDate: (eventDate ?? existing.eventDate).trim().slice(0, 60),
+        eventLocation: (eventLocation ?? existing.eventLocation)
+          .trim()
+          .slice(0, 80),
+        contactInfo: (contactInfo ?? existing.contactInfo).trim().slice(0, 80),
+        isActive: typeof isActive === 'boolean' ? isActive : existing.isActive,
+        updatedAt: new Date().toISOString(),
+      };
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          `UPDATE event_banners
+           SET category = $1, title = $2, subtitle = $3, event_date = $4, event_location = $5, contact_info = $6, is_active = $7, updated_at = $8
+           WHERE id = $9 AND apartment_id = $10`,
+          [
+            updated.category,
+            updated.title,
+            updated.subtitle,
+            updated.eventDate,
+            updated.eventLocation,
+            updated.contactInfo,
+            updated.isActive,
+            updated.updatedAt,
+            id,
+            apartmentId,
+          ]
+        );
+      } else {
+        const store = readStore();
+        if (!Array.isArray(store.banners)) store.banners = [];
+        const idx = store.banners.findIndex(
+          (b) => b.id === id && b.apartmentId === apartmentId
+        );
+        if (idx !== -1) {
+          store.banners[idx] = updated;
+          writeStore(store);
+        }
+      }
+
+      res.json({ banner: updated });
+    })
+  );
+
+  app.delete(
+    '/api/banners/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const del = await getPgPool().query(
+          'DELETE FROM event_banners WHERE id = $1 AND apartment_id = $2 RETURNING id',
+          [id, apartmentId]
+        );
+        if (del.rows.length === 0) {
+          res.status(404).json({ error: '해당 배너를 찾을 수 없습니다.' });
+          return;
+        }
+        res.json({ ok: true });
+        return;
+      }
+
+      const store = readStore();
+      if (!Array.isArray(store.banners)) store.banners = [];
+      if (
+        !store.banners.some((b) => b.id === id && b.apartmentId === apartmentId)
+      ) {
+        res.status(404).json({ error: '해당 배너를 찾을 수 없습니다.' });
+        return;
+      }
+
+      store.banners = store.banners.filter(
+        (b) => !(b.id === id && b.apartmentId === apartmentId)
+      );
+      writeStore(store);
+      res.json({ ok: true });
+    })
+  );
+
+  // External Bottom Ad Slot
+  app.get(
+    '/api/ad-slot',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const found = await getPgPool().query(
+          'SELECT * FROM external_ads WHERE apartment_id = $1 LIMIT 1',
+          [apartmentId]
+        );
+        const adSlot = found.rows[0]
+          ? mapExternalAdRow(found.rows[0])
+          : createDefaultExternalAd(apartmentId);
+        res.json({ adSlot });
+        return;
+      }
+
+      const store = readStore();
+      const adSlot =
+        store.externalAds?.[apartmentId] || createDefaultExternalAd(apartmentId);
+      res.json({ adSlot });
+    })
+  );
+
+  app.put(
+    '/api/ad-slot',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      const body = req.body as {
+        mode?: AdSlotMode;
+        sponsorName?: string;
+        headline?: string;
+        description?: string;
+        imageUrl?: string;
+        imageBase64?: string | null;
+        linkUrl?: string;
+        ctaLabel?: string;
+        contactInfo?: string;
+        adsenseClientId?: string;
+        adsenseSlotId?: string;
+        adfitUnitId?: string;
+      };
+
+      const validModes: AdSlotMode[] = [
+        'inquiry',
+        'custom',
+        'adsense',
+        'adfit',
+        'hidden',
+      ];
+      const cleanMode: AdSlotMode =
+        body.mode && validModes.includes(body.mode) ? body.mode : 'inquiry';
+
+      const rawLink = (body.linkUrl || '').trim();
+      const safeLink = sanitizeExternalHttpUrl(rawLink);
+      if (rawLink && !safeLink) {
+        res.status(400).json({
+          error: '연결 링크 URL은 http:// 또는 https://로 시작해야 합니다.',
+        });
+        return;
+      }
+
+      let resolvedImageUrl = '';
+      if (body.imageBase64) {
+        try {
+          resolvedImageUrl = saveBase64Photo(body.imageBase64) || '';
+        } catch (err) {
+          res.status(400).json({
+            error:
+              err instanceof Error
+                ? err.message
+                : '광고 이미지를 처리하는 중 오류가 발생했습니다.',
+          });
+          return;
+        }
+      } else if (body.imageUrl) {
+        const trimmedImg = body.imageUrl.trim();
+        if (
+          trimmedImg.startsWith('/api/uploads/') ||
+          trimmedImg.startsWith('/src/assets/') ||
+          /^https?:\/\//i.test(trimmedImg) ||
+          /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(trimmedImg)
+        ) {
+          resolvedImageUrl = trimmedImg;
+        } else {
+          res.status(400).json({
+            error:
+              '이미지 URL은 http(s):// 주소이거나 업로드된 이미지여야 합니다.',
+          });
+          return;
+        }
+      }
+
+      const cleanHeadline = (body.headline || '').trim().slice(0, 80);
+      const cleanAdsenseClient = (body.adsenseClientId || '').trim().slice(0, 40);
+      const cleanAdsenseSlot = (body.adsenseSlotId || '').trim().slice(0, 40);
+      const cleanAdfitUnit = (body.adfitUnitId || '').trim().slice(0, 40);
+
+      if (cleanMode === 'custom' && !cleanHeadline && !resolvedImageUrl) {
+        res.status(400).json({
+          error: '직접 배너 모드에서는 광고 제목 또는 배너 이미지를 입력해 주세요.',
+        });
+        return;
+      }
+      if (cleanMode === 'adsense' && (!cleanAdsenseClient || !cleanAdsenseSlot)) {
+        res.status(400).json({
+          error: 'Google AdSense 클라이언트 ID(ca-pub-...)와 슬롯 ID를 모두 입력해 주세요.',
+        });
+        return;
+      }
+      if (cleanMode === 'adfit' && !cleanAdfitUnit) {
+        res.status(400).json({
+          error: '카카오 애드핏 광고 단위 ID(DAN-...)를 입력해 주세요.',
+        });
+        return;
+      }
+
+      const nextRecord: ExternalAdRecord = {
+        apartmentId,
+        mode: cleanMode,
+        sponsorName: (body.sponsorName || '').trim().slice(0, 40),
+        headline: cleanHeadline,
+        description: (body.description || '').trim().slice(0, 160),
+        imageUrl: resolvedImageUrl,
+        linkUrl: safeLink,
+        ctaLabel: (body.ctaLabel || '').trim().slice(0, 24) || '자세히 보기',
+        contactInfo: (body.contactInfo || '').trim().slice(0, 80),
+        adsenseClientId: cleanAdsenseClient,
+        adsenseSlotId: cleanAdsenseSlot,
+        adfitUnitId: cleanAdfitUnit,
+        updatedAt: new Date().toISOString(),
+      };
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        await getPgPool().query(
+          `INSERT INTO external_ads (
+            apartment_id, mode, sponsor_name, headline, description, image_url, link_url,
+            cta_label, contact_info, adsense_client_id, adsense_slot_id, adfit_unit_id, updated_at
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+          ON CONFLICT (apartment_id) DO UPDATE SET
+            mode = EXCLUDED.mode,
+            sponsor_name = EXCLUDED.sponsor_name,
+            headline = EXCLUDED.headline,
+            description = EXCLUDED.description,
+            image_url = EXCLUDED.image_url,
+            link_url = EXCLUDED.link_url,
+            cta_label = EXCLUDED.cta_label,
+            contact_info = EXCLUDED.contact_info,
+            adsense_client_id = EXCLUDED.adsense_client_id,
+            adsense_slot_id = EXCLUDED.adsense_slot_id,
+            adfit_unit_id = EXCLUDED.adfit_unit_id,
+            updated_at = EXCLUDED.updated_at`,
+          [
+            nextRecord.apartmentId,
+            nextRecord.mode,
+            nextRecord.sponsorName,
+            nextRecord.headline,
+            nextRecord.description,
+            nextRecord.imageUrl,
+            nextRecord.linkUrl,
+            nextRecord.ctaLabel,
+            nextRecord.contactInfo,
+            nextRecord.adsenseClientId,
+            nextRecord.adsenseSlotId,
+            nextRecord.adfitUnitId,
+            nextRecord.updatedAt,
+          ]
+        );
+      } else {
+        const store = readStore();
+        if (!store.externalAds || typeof store.externalAds !== 'object') {
+          store.externalAds = {};
+        }
+        const prevImg = store.externalAds[apartmentId]?.imageUrl;
+        if (prevImg && prevImg !== resolvedImageUrl) {
+          deleteUploadedPhotoIfLocal(prevImg);
+        }
+        store.externalAds[apartmentId] = nextRecord;
+        writeStore(store);
+      }
+
+      res.json({ adSlot: nextRecord });
+    })
+  );
+
+  // Update Passwords
   app.patch(
     '/api/settings/passwords',
     requireAuth,
     requireAdmin,
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
       const { companyPassword, adminPassword } = req.body as {
         companyPassword?: string;
         adminPassword?: string;
       };
+      const apartmentId = req.session!.apartmentId;
+
+      if (companyPassword !== undefined && companyPassword.trim().length < 4) {
+        res
+          .status(400)
+          .json({ error: '회사 공통 비밀번호는 4자 이상이어야 합니다.' });
+        return;
+      }
+      if (adminPassword !== undefined && adminPassword.trim().length < 4) {
+        res
+          .status(400)
+          .json({ error: '관리자 비밀번호는 4자 이상이어야 합니다.' });
+        return;
+      }
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const found = await pool.query(
+          'SELECT * FROM apartments WHERE id = $1 LIMIT 1',
+          [apartmentId]
+        );
+        if (found.rows.length === 0) {
+          res.status(404).json({ error: '아파트 정보를 찾을 수 없습니다.' });
+          return;
+        }
+        const apt = mapApartmentRow(found.rows[0]);
+        const nextCompanyPw =
+          companyPassword !== undefined
+            ? companyPassword.trim()
+            : apt.companyPassword;
+        const nextAdminPw =
+          adminPassword !== undefined
+            ? adminPassword.trim()
+            : apt.adminPassword;
+        await pool.query(
+          'UPDATE apartments SET company_password = $1, admin_password = $2 WHERE id = $3',
+          [nextCompanyPw, nextAdminPw, apartmentId]
+        );
+        res.json({ ok: true });
+        return;
+      }
+
       const store = readStore();
-      const apt = store.apartments.find((a) => a.id === req.session!.apartmentId);
+      const apt = store.apartments.find((a) => a.id === apartmentId);
       if (!apt) {
         res.status(404).json({ error: '아파트 정보를 찾을 수 없습니다.' });
         return;
       }
 
       if (companyPassword !== undefined) {
-        if (companyPassword.trim().length < 4) {
-          res.status(400).json({ error: '회사 공통 비밀번호는 4자 이상이어야 합니다.' });
-          return;
-        }
         apt.companyPassword = companyPassword.trim();
       }
       if (adminPassword !== undefined) {
-        if (adminPassword.trim().length < 4) {
-          res.status(400).json({ error: '관리자 비밀번호는 4자 이상이어야 합니다.' });
-          return;
-        }
         apt.adminPassword = adminPassword.trim();
       }
 
       writeStore(store);
       res.json({ ok: true });
-    }
+    })
   );
 
-  // CSV / Excel Unified Download (Admin only, scoped to apartment)
+  // CSV / Excel Unified Download
   app.get(
     '/api/logs/export.csv',
     requireAuth,
     requireAdmin,
-    (req: AuthedRequest, res: Response) => {
-      const { workerId, date, q, status } = req.query as {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const query = req.query as {
         workerId?: string;
         date?: string;
         q?: string;
         status?: string;
       };
       const apartmentId = req.session!.apartmentId;
-      const store = readStore();
-      const apt = store.apartments.find((a) => a.id === apartmentId);
-      let logs = store.logs.filter((l) => l.apartmentId === apartmentId);
 
-      if (workerId && workerId !== 'all') {
-        logs = logs.filter((l) => l.workerId === workerId || l.workerName === workerId);
-      }
-      if (status && status !== 'all') {
-        logs = logs.filter((l) => (l.status || 'completed') === status);
-      }
-      if (date && date.trim() !== '') {
-        logs = logs.filter((l) => l.workDate === date.trim());
-      }
-      if (q && q.trim() !== '') {
-        const keyword = q.trim().toLowerCase();
-        logs = logs.filter(
-          (l) =>
-            l.location.toLowerCase().includes(keyword) ||
-            l.content.toLowerCase().includes(keyword) ||
-            l.workerName.toLowerCase().includes(keyword)
+      let aptName = '관리사무소';
+      let logs: WorkLogRecord[] = [];
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const [aptRes, logsRes] = await Promise.all([
+          pool.query('SELECT name FROM apartments WHERE id = $1 LIMIT 1', [
+            apartmentId,
+          ]),
+          pool.query('SELECT * FROM work_logs WHERE apartment_id = $1', [
+            apartmentId,
+          ]),
+        ]);
+        if (aptRes.rows[0]?.name) aptName = String(aptRes.rows[0].name);
+        logs = filterAndSortLogs(logsRes.rows.map(mapLogRow), query);
+      } else {
+        const store = readStore();
+        const apt = store.apartments.find((a) => a.id === apartmentId);
+        aptName = apt?.name || '관리사무소';
+        logs = filterAndSortLogs(
+          store.logs.filter((l) => l.apartmentId === apartmentId),
+          query
         );
       }
-
-      logs.sort((a, b) => {
-        if (a.workDate !== b.workDate) {
-          return b.workDate.localeCompare(a.workDate);
-        }
-        return b.createdAt.localeCompare(a.createdAt);
-      });
 
       const statusText = (s?: WorkStatus) =>
         s === 'pending' ? '대기' : s === 'in_progress' ? '진행 중' : '완료';
@@ -1593,7 +3229,6 @@ async function startServer() {
         '최초등록시각',
         '최종수정시각',
       ];
-      const aptName = apt?.name || '관리사무소';
       const rows = logs.map((log, index) => [
         String(index + 1),
         aptName,
@@ -1620,12 +3255,40 @@ async function startServer() {
         `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`
       );
       res.send(bom + csvBody);
+    })
+  );
+
+  // Express JSON error boundary
+  app.use(
+    (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+      console.error('API Error:', err);
+      res.status(500).json({
+        error: '서버 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+      });
     }
   );
 
-  // Vite middleware or production static
+  return app;
+}
+
+export const app = createApp();
+export default app;
+
+function isDirectServerExecution(): boolean {
+  if (IS_VERCEL || typeof process.argv[1] !== 'string') {
+    return false;
+  }
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename);
+  } catch {
+    return path.resolve(process.argv[1]) === path.resolve(__filename);
+  }
+}
+
+async function startStandaloneServer() {
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
+    const vitePkg = 'vite';
+    const { createServer: createViteServer } = await import(vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1645,7 +3308,9 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (isDirectServerExecution()) {
+  startStandaloneServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
