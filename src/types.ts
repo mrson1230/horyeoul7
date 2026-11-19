@@ -91,9 +91,16 @@ export interface ExternalAdConfig {
   updatedAt: string;
 }
 
+export interface AdSlotStateResponse {
+  adSlot: ExternalAdConfig;
+  globalAdSlot: ExternalAdConfig;
+  hasApartmentOverride: boolean;
+}
+
 export interface SessionInfo {
   authenticated: boolean;
   isAdmin: boolean;
+  isMaster?: boolean;
   companyId: string;
   apartmentId: string;
   apartmentName: string;

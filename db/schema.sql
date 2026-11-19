@@ -110,3 +110,20 @@ CREATE TABLE IF NOT EXISTS external_ads (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS global_ad_slot (
+  id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL DEFAULT 'inquiry',
+  sponsor_name TEXT NOT NULL DEFAULT '',
+  headline TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  image_url TEXT NOT NULL DEFAULT '',
+  link_url TEXT NOT NULL DEFAULT '',
+  cta_label TEXT NOT NULL DEFAULT '',
+  contact_info TEXT NOT NULL DEFAULT '',
+  adsense_client_id TEXT NOT NULL DEFAULT '',
+  adsense_slot_id TEXT NOT NULL DEFAULT '',
+  adfit_unit_id TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+
+

@@ -127,6 +127,14 @@
       "isAdmin": true,
       "createdAt": "2026-11-18T12:28:02.004Z",
       "lastSeenAt": "2026-11-18T12:28:02.017Z"
+    },
+    "eyJpZCI6IjZhNjRhZjJlNzdkMzE1Y2UiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjp0cnVlLCJtc3QiOnRydWUsImlhdCI6MTc5NTA4NTgzNjkxMH0.xvYdQ-jqRyMoBhU6sLtjcUB04WVgJ5f6clypUpDV54Q": {
+      "token": "eyJpZCI6IjZhNjRhZjJlNzdkMzE1Y2UiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjp0cnVlLCJtc3QiOnRydWUsImlhdCI6MTc5NTA4NTgzNjkxMH0.xvYdQ-jqRyMoBhU6sLtjcUB04WVgJ5f6clypUpDV54Q",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": true,
+      "isMaster": true,
+      "createdAt": "2026-11-19T10:57:16.873Z",
+      "lastSeenAt": "2026-11-19T10:57:16.910Z"
     }
   },
   "notices": [
@@ -193,21 +201,20 @@
     }
   ],
   "banners": [],
-  "externalAds": {
-    "apt-horyeoul7": {
-      "apartmentId": "apt-horyeoul7",
-      "mode": "inquiry",
-      "sponsorName": "지역 상가 · 파트너 광고 영역",
-      "headline": "이 자리에 외부 광고 및 제휴 배너를 게재할 수 있습니다",
-      "description": "단지 인근 상가·협력업체 배너, Google AdSense, 카카오 애드핏 연동을 지원합니다.",
-      "imageUrl": "",
-      "linkUrl": "",
-      "ctaLabel": "자세히 보기",
-      "contactInfo": "관리자 메뉴 > 하단 외부 광고 설정에서 변경 가능",
-      "adsenseClientId": "",
-      "adsenseSlotId": "",
-      "adfitUnitId": "",
-      "updatedAt": "2026-11-18T12:28:02.026Z"
-    }
+  "externalAds": {},
+  "globalAd": {
+    "apartmentId": "__global__",
+    "mode": "inquiry",
+    "sponsorName": "지역 상가 · 파트너 광고 영역",
+    "headline": "이 자리에 외부 광고 및 제휴 배너를 게재할 수 있습니다",
+    "description": "단지 인근 상가·협력업체 배너, Google AdSense, 카카오 애드핏 연동을 지원합니다.",
+    "imageUrl": "",
+    "linkUrl": "",
+    "ctaLabel": "자세히 보기",
+    "contactInfo": "관리자 메뉴 > 하단 외부 광고 설정에서 변경 가능",
+    "adsenseClientId": "",
+    "adsenseSlotId": "",
+    "adfitUnitId": "",
+    "updatedAt": "2026-11-19T10:57:16.930Z"
   }
 }

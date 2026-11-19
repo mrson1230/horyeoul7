@@ -25,6 +25,7 @@ import {
   setStoredWorkerId,
 } from './utils/api';
 import type {
+  AdSlotStateResponse,
   EventBanner,
   ExternalAdConfig,
   Handover,
@@ -79,6 +80,9 @@ export default function App() {
   const [handovers, setHandovers] = useState<Handover[]>([]);
   const [banners, setBanners] = useState<EventBanner[]>([]);
   const [adSlot, setAdSlot] = useState<ExternalAdConfig>(DEFAULT_AD_SLOT);
+  const [globalAdSlot, setGlobalAdSlot] =
+    useState<ExternalAdConfig>(DEFAULT_AD_SLOT);
+  const [hasApartmentOverride, setHasApartmentOverride] = useState(false);
 
   const [filterWorkerId, setFilterWorkerId] = useState('all');
   const [filterDate, setFilterDate] = useState('');
@@ -162,6 +166,12 @@ export default function App() {
     }
   }, [session?.authenticated, filterWorkerId, filterDate, filterStatus, searchQuery]);
 
+  const applyAdState = useCallback((state: AdSlotStateResponse) => {
+    if (state.adSlot) setAdSlot(state.adSlot);
+    if (state.globalAdSlot) setGlobalAdSlot(state.globalAdSlot);
+    setHasApartmentOverride(Boolean(state.hasApartmentOverride));
+  }, []);
+
   const fetchNoticesAndHandovers = useCallback(async () => {
     if (!session?.authenticated) return;
     try {
@@ -169,18 +179,16 @@ export default function App() {
         apiFetch<{ notices: Notice[] }>('/api/notices'),
         apiFetch<{ handovers: Handover[] }>('/api/handovers'),
         apiFetch<{ banners: EventBanner[] }>('/api/banners'),
-        apiFetch<{ adSlot: ExternalAdConfig }>('/api/ad-slot'),
+        apiFetch<AdSlotStateResponse>('/api/ad-slot'),
       ]);
       setNotices(noticeRes.notices);
       setHandovers(handoverRes.handovers);
       setBanners(bannerRes.banners);
-      if (adSlotRes.adSlot) {
-        setAdSlot(adSlotRes.adSlot);
-      }
+      applyAdState(adSlotRes);
     } catch {
       // Handled gracefully
     }
-  }, [session?.authenticated]);
+  }, [session?.authenticated, applyAdState]);
 
   useEffect(() => {
     if (session?.authenticated) {
@@ -211,9 +219,12 @@ export default function App() {
     setStoredWorkerId('');
     setBanners([]);
     setAdSlot(DEFAULT_AD_SLOT);
+    setGlobalAdSlot(DEFAULT_AD_SLOT);
+    setHasApartmentOverride(false);
     setSession((prev) => ({
       authenticated: false,
       isAdmin: false,
+      isMaster: false,
       companyId: prev?.companyId || 'horyeoul7',
       apartmentId: prev?.apartmentId || 'apt-horyeoul7',
       apartmentName: prev?.apartmentName || '호려울마을 7단지',
@@ -587,18 +598,24 @@ export default function App() {
         {activeTab === 'admin' && (
           <AdminPanel
             isAdmin={session.isAdmin}
+            isMaster={Boolean(session.isMaster)}
             apartmentName={session.apartmentName}
             officeName={session.officeName}
             workers={workers}
             logs={logs}
             banners={banners}
             adSlot={adSlot}
+            globalAdSlot={globalAdSlot}
+            hasApartmentOverride={hasApartmentOverride}
             filterWorkerId={filterWorkerId}
             filterDate={filterDate}
             filterStatus={filterStatus}
             searchQuery={searchQuery}
             onAdminStateChanged={(isAdmin) =>
               setSession((prev) => (prev ? { ...prev, isAdmin } : prev))
+            }
+            onMasterStateChanged={(isMaster) =>
+              setSession((prev) => (prev ? { ...prev, isMaster } : prev))
             }
             onApartmentUpdated={(apt) =>
               setSession((prev) =>
@@ -613,7 +630,7 @@ export default function App() {
             }
             onWorkersChanged={() => void fetchWorkers()}
             onBannersChanged={setBanners}
-            onAdSlotChanged={setAdSlot}
+            onAdStateChanged={applyAdState}
             onEditLog={setEditingLog}
             onLogDeleted={(id) =>
               setLogs((prev) => prev.filter((item) => item.id !== id))

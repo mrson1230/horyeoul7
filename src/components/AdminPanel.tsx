@@ -17,11 +17,13 @@ import {
   apiFetch,
   getStoredToken,
   getTodayKoreaDate,
+  setStoredToken,
 } from '../utils/api';
 import { AdSlotManagerSection } from './AdSlotManagerSection';
 import { BannerMakerSection } from './BannerMakerSection';
 import { WorkStatusLabel } from './WorkStatusLabel';
 import type {
+  AdSlotStateResponse,
   Apartment,
   EventBanner,
   ExternalAdConfig,
@@ -32,42 +34,50 @@ import type {
 
 interface AdminPanelProps {
   isAdmin: boolean;
+  isMaster: boolean;
   apartmentName: string;
   officeName: string;
   workers: Worker[];
   logs: WorkLog[];
   banners: EventBanner[];
   adSlot: ExternalAdConfig;
+  globalAdSlot: ExternalAdConfig;
+  hasApartmentOverride: boolean;
   filterWorkerId: string;
   filterDate: string;
   filterStatus: 'all' | WorkStatus;
   searchQuery: string;
   onAdminStateChanged: (isAdmin: boolean) => void;
+  onMasterStateChanged: (isMaster: boolean) => void;
   onApartmentUpdated: (apt: Apartment) => void;
   onWorkersChanged: () => void;
   onBannersChanged: (next: EventBanner[]) => void;
-  onAdSlotChanged: (next: ExternalAdConfig) => void;
+  onAdStateChanged: (next: AdSlotStateResponse) => void;
   onEditLog: (log: WorkLog) => void;
   onLogDeleted: (id: string) => void;
 }
 
 export function AdminPanel({
   isAdmin,
+  isMaster,
   apartmentName,
   officeName,
   workers,
   logs,
   banners,
   adSlot,
+  globalAdSlot,
+  hasApartmentOverride,
   filterWorkerId,
   filterDate,
   filterStatus,
   searchQuery,
   onAdminStateChanged,
+  onMasterStateChanged,
   onApartmentUpdated,
   onWorkersChanged,
   onBannersChanged,
-  onAdSlotChanged,
+  onAdStateChanged,
   onEditLog,
   onLogDeleted,
 }: AdminPanelProps) {
@@ -135,10 +145,16 @@ export function AdminPanel({
     setAuthError(null);
     setAuthLoading(true);
     try {
-      await apiFetch('/api/auth/admin/unlock', {
-        method: 'POST',
-        body: JSON.stringify({ adminPassword: adminPasswordInput }),
-      });
+      const res = await apiFetch<{ isAdmin: boolean; token?: string }>(
+        '/api/auth/admin/unlock',
+        {
+          method: 'POST',
+          body: JSON.stringify({ adminPassword: adminPasswordInput }),
+        }
+      );
+      if (res.token) {
+        setStoredToken(res.token);
+      }
       setAdminPasswordInput('');
       onAdminStateChanged(true);
     } catch (err) {
@@ -151,7 +167,13 @@ export function AdminPanel({
   };
 
   const handleLockAdmin = async () => {
-    await apiFetch('/api/auth/admin/lock', { method: 'POST' });
+    const res = await apiFetch<{ isAdmin: boolean; token?: string }>(
+      '/api/auth/admin/lock',
+      { method: 'POST' }
+    );
+    if (res.token) {
+      setStoredToken(res.token);
+    }
     onAdminStateChanged(false);
   };
 
@@ -612,7 +634,11 @@ export function AdminPanel({
       {/* Bottom External Ad Slot Configuration */}
       <AdSlotManagerSection
         adSlot={adSlot}
-        onAdSlotChanged={onAdSlotChanged}
+        globalAdSlot={globalAdSlot}
+        hasApartmentOverride={hasApartmentOverride}
+        isMaster={isMaster}
+        onMasterStateChanged={onMasterStateChanged}
+        onAdStateChanged={onAdStateChanged}
       />
 
       {/* Apartment Management & New Apartment Registration */}

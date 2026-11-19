@@ -22,7 +22,17 @@ const PG_CONNECTION_STRING = (
   process.env.SUPABASE_DB_URL ||
   ''
 ).trim();
-const USE_POSTGRES = PG_CONNECTION_STRING.length > 0;
+const HAS_VALID_PG_URL = /^postgres(ql)?:\/\/.+/i.test(PG_CONNECTION_STRING);
+const PG_CONFIG_INVALID =
+  PG_CONNECTION_STRING.length > 0 && !HAS_VALID_PG_URL;
+const USE_POSTGRES = HAS_VALID_PG_URL;
+
+const SESSION_SECRET = (
+  process.env.SESSION_SECRET ||
+  (USE_POSTGRES
+    ? crypto.createHash('sha256').update(PG_CONNECTION_STRING).digest('hex')
+    : 'apt-worklog-stateless-session-secret-v1')
+).trim();
 
 const DATA_DIR = IS_VERCEL
   ? path.join(os.tmpdir(), 'apt-worklog-data')
@@ -130,6 +140,7 @@ interface SessionRecord {
   token: string;
   apartmentId: string;
   isAdmin: boolean;
+  isMaster?: boolean;
   createdAt: string;
   lastSeenAt: string;
 }
@@ -149,6 +160,7 @@ interface StoreData {
   handovers: HandoverRecord[];
   banners?: EventBannerRecord[];
   externalAds?: Record<string, ExternalAdRecord>;
+  globalAd?: ExternalAdRecord;
   sessions: Record<string, SessionRecord>;
 }
 
@@ -345,6 +357,7 @@ function createInitialStore(): StoreData {
     handovers: createSeedHandovers(),
     banners: [],
     externalAds: {},
+    globalAd: createDefaultExternalAd('__global__'),
     sessions: {},
   };
 }
@@ -438,13 +451,31 @@ async function ensurePgReady(): Promise<void> {
         token TEXT PRIMARY KEY,
         apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
         is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+        is_master BOOLEAN NOT NULL DEFAULT FALSE,
         created_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL
       );
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS is_master BOOLEAN NOT NULL DEFAULT FALSE;
       CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions (last_seen_at);
 
       CREATE TABLE IF NOT EXISTS external_ads (
         apartment_id TEXT PRIMARY KEY REFERENCES apartments(id) ON DELETE CASCADE,
+        mode TEXT NOT NULL DEFAULT 'inquiry',
+        sponsor_name TEXT NOT NULL DEFAULT '',
+        headline TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        image_url TEXT NOT NULL DEFAULT '',
+        link_url TEXT NOT NULL DEFAULT '',
+        cta_label TEXT NOT NULL DEFAULT '',
+        contact_info TEXT NOT NULL DEFAULT '',
+        adsense_client_id TEXT NOT NULL DEFAULT '',
+        adsense_slot_id TEXT NOT NULL DEFAULT '',
+        adfit_unit_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS global_ad_slot (
+        id TEXT PRIMARY KEY,
         mode TEXT NOT NULL DEFAULT 'inquiry',
         sponsor_name TEXT NOT NULL DEFAULT '',
         headline TEXT NOT NULL DEFAULT '',
@@ -631,6 +662,10 @@ function readStore(): StoreData {
     }
     if (!parsed.externalAds || typeof parsed.externalAds !== 'object') {
       parsed.externalAds = {};
+      mutated = true;
+    }
+    if (!parsed.globalAd || typeof parsed.globalAd !== 'object') {
+      parsed.globalAd = createDefaultExternalAd('__global__');
       mutated = true;
     }
 
@@ -835,7 +870,7 @@ function mapExternalAdRow(r: Record<string, unknown>): ExternalAdRecord {
     ? (rawMode as AdSlotMode)
     : 'inquiry';
   return {
-    apartmentId: String(r.apartment_id),
+    apartmentId: String(r.apartment_id || '__global__'),
     mode,
     sponsorName: String(r.sponsor_name || ''),
     headline: String(r.headline || ''),
@@ -858,6 +893,73 @@ function sanitizeExternalHttpUrl(raw: string): string {
     return trimmed.slice(0, 500);
   }
   return '';
+}
+
+function createSignedToken(
+  apartmentId: string,
+  isAdmin: boolean,
+  isMaster = false
+): string {
+  const payload = {
+    id: crypto.randomBytes(8).toString('hex'),
+    apt: apartmentId,
+    adm: isAdmin,
+    mst: isMaster,
+    iat: Date.now(),
+  };
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString(
+    'base64url'
+  );
+  const sig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(encoded)
+    .digest('base64url');
+  return `${encoded}.${sig}`;
+}
+
+function verifySignedToken(token: string): SessionRecord | null {
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [encoded, sig] = parts;
+  if (!encoded || !sig) return null;
+
+  const expectedSig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(encoded)
+    .digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expectedSig);
+  if (
+    sigBuf.length !== expectedBuf.length ||
+    !crypto.timingSafeEqual(sigBuf, expectedBuf)
+  ) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(encoded, 'base64url').toString('utf8')
+    ) as {
+      apt?: string;
+      adm?: boolean;
+      mst?: boolean;
+      iat?: number;
+    };
+    if (!parsed.apt || typeof parsed.iat !== 'number') return null;
+    const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
+    if (Date.now() - parsed.iat > maxAgeMs) return null;
+    const createdIso = new Date(parsed.iat).toISOString();
+    return {
+      token,
+      apartmentId: parsed.apt,
+      isAdmin: Boolean(parsed.adm),
+      isMaster: Boolean(parsed.mst),
+      createdAt: createdIso,
+      lastSeenAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function saveBase64Photo(dataUrl: string): string | null {
@@ -931,21 +1033,24 @@ async function findSessionByToken(token: string): Promise<SessionRecord | null> 
   if (USE_POSTGRES) {
     await ensurePgReady();
     const res = await getPgPool().query(
-      'SELECT token, apartment_id, is_admin, created_at, last_seen_at FROM sessions WHERE token = $1',
+      'SELECT token, apartment_id, is_admin, is_master, created_at, last_seen_at FROM sessions WHERE token = $1',
       [token]
     );
     const row = res.rows[0];
-    if (!row) return null;
-    return {
-      token: String(row.token),
-      apartmentId: String(row.apartment_id),
-      isAdmin: Boolean(row.is_admin),
-      createdAt: String(row.created_at),
-      lastSeenAt: String(row.last_seen_at),
-    };
+    if (row) {
+      return {
+        token: String(row.token),
+        apartmentId: String(row.apartment_id),
+        isAdmin: Boolean(row.is_admin),
+        isMaster: Boolean(row.is_master),
+        createdAt: String(row.created_at),
+        lastSeenAt: String(row.last_seen_at),
+      };
+    }
+    return verifySignedToken(token);
   }
   const store = readStore();
-  return store.sessions[token] || null;
+  return store.sessions[token] || verifySignedToken(token);
 }
 
 const requireAuth = asyncHandler(
@@ -1053,7 +1158,16 @@ export function createApp(): express.Express {
         res.json({ ok: true, storage: 'postgres' });
         return;
       }
-      res.json({ ok: true, storage: IS_VERCEL ? 'memory' : 'file' });
+      res.json({
+        ok: true,
+        storage: IS_VERCEL ? 'memory' : 'file',
+        ...(PG_CONFIG_INVALID
+          ? {
+              pgConfigWarning:
+                'DATABASE_URL 값이 올바른 postgres:// 주소 형식이 아니어서 임시 메모리 모드로 동작 중입니다.',
+            }
+          : {}),
+      });
     })
   );
 
@@ -1207,11 +1321,11 @@ export function createApp(): express.Express {
             ]
           );
           if (autoLogin) {
-            token = crypto.randomBytes(24).toString('hex');
+            token = createSignedToken(newApt.id, true, false);
             await client.query(
-              `INSERT INTO sessions (token, apartment_id, is_admin, created_at, last_seen_at)
-               VALUES ($1, $2, $3, $4, $5)`,
-              [token, newApt.id, true, nowIso, nowIso]
+              `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [token, newApt.id, true, false, nowIso, nowIso]
             );
           }
           await client.query('COMMIT');
@@ -1242,11 +1356,12 @@ export function createApp(): express.Express {
         store.notices.unshift(welcomeNotice);
 
         if (autoLogin) {
-          token = crypto.randomBytes(24).toString('hex');
+          token = createSignedToken(newApt.id, true, false);
           store.sessions[token] = {
             token,
             apartmentId: newApt.id,
             isAdmin: true,
+            isMaster: false,
             createdAt: nowIso,
             lastSeenAt: nowIso,
           };
@@ -1261,6 +1376,7 @@ export function createApp(): express.Express {
           ? {
               authenticated: true,
               isAdmin: true,
+              isMaster: false,
               companyId: newApt.companyId,
               apartmentId: newApt.id,
               apartmentName: newApt.name,
@@ -1371,6 +1487,7 @@ export function createApp(): express.Express {
         res.json({
           authenticated: true,
           isAdmin: session.isAdmin,
+          isMaster: Boolean(session.isMaster),
           companyId: apt.companyId,
           apartmentId: apt.id,
           apartmentName: apt.name,
@@ -1381,12 +1498,13 @@ export function createApp(): express.Express {
 
       const store = readStore();
       const defaultApt = store.apartments[0];
-      const session = token ? store.sessions[token] : undefined;
+      const session = token ? await findSessionByToken(token) : null;
 
       if (!session) {
         res.json({
           authenticated: false,
           isAdmin: false,
+          isMaster: false,
           companyId: defaultApt.companyId,
           apartmentId: defaultApt.id,
           apartmentName: defaultApt.name,
@@ -1401,6 +1519,7 @@ export function createApp(): express.Express {
       res.json({
         authenticated: true,
         isAdmin: session.isAdmin,
+        isMaster: Boolean(session.isMaster),
         companyId: apt.companyId,
         apartmentId: apt.id,
         apartmentName: apt.name,
@@ -1419,38 +1538,47 @@ export function createApp(): express.Express {
         apartmentId?: string;
       };
       const trimmedId = (companyId || '').trim().toLowerCase();
+      const rawPassword = password || '';
+      const trimmedPassword = rawPassword.trim();
 
       if (USE_POSTGRES) {
         await ensurePgReady();
         const pool = getPgPool();
-        const aptRes = apartmentId
-          ? await pool.query('SELECT * FROM apartments WHERE id = $1 LIMIT 1', [
-              apartmentId,
-            ])
-          : await pool.query(
+        let aptRes = trimmedId
+          ? await pool.query(
               'SELECT * FROM apartments WHERE LOWER(company_id) = $1 LIMIT 1',
               [trimmedId]
-            );
+            )
+          : await pool.query('SELECT * FROM apartments WHERE id = $1 LIMIT 1', [
+              apartmentId || DEFAULT_APARTMENT_ID,
+            ]);
+        if (aptRes.rows.length === 0 && apartmentId) {
+          aptRes = await pool.query(
+            'SELECT * FROM apartments WHERE id = $1 LIMIT 1',
+            [apartmentId]
+          );
+        }
         const apt = aptRes.rows[0] ? mapApartmentRow(aptRes.rows[0]) : null;
 
-        if (
-          !apt ||
-          !password ||
-          apt.companyId.toLowerCase() !== trimmedId ||
-          password !== apt.companyPassword
-        ) {
+        const passwordMatches =
+          Boolean(apt) &&
+          Boolean(trimmedPassword) &&
+          (rawPassword === apt!.companyPassword ||
+            trimmedPassword === apt!.companyPassword.trim());
+
+        if (!apt || apt.companyId.toLowerCase() !== trimmedId || !passwordMatches) {
           res.status(401).json({
             error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
           });
           return;
         }
 
-        const token = crypto.randomBytes(24).toString('hex');
+        const token = createSignedToken(apt.id, false, false);
         const nowIso = new Date().toISOString();
         await pool.query(
-          `INSERT INTO sessions (token, apartment_id, is_admin, created_at, last_seen_at)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [token, apt.id, false, nowIso, nowIso]
+          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [token, apt.id, false, false, nowIso, nowIso]
         );
         await pool.query(`
           DELETE FROM sessions
@@ -1463,6 +1591,7 @@ export function createApp(): express.Express {
           token,
           authenticated: true,
           isAdmin: false,
+          isMaster: false,
           companyId: apt.companyId,
           apartmentId: apt.id,
           apartmentName: apt.name,
@@ -1472,30 +1601,36 @@ export function createApp(): express.Express {
       }
 
       const store = readStore();
-      const apt = apartmentId
-        ? store.apartments.find((a) => a.id === apartmentId)
-        : store.apartments.find(
-            (a) => a.companyId.toLowerCase() === trimmedId
-          );
+      const apt =
+        (trimmedId
+          ? store.apartments.find(
+              (a) => a.companyId.toLowerCase() === trimmedId
+            )
+          : undefined) ||
+        (apartmentId
+          ? store.apartments.find((a) => a.id === apartmentId)
+          : undefined);
 
-      if (
-        !apt ||
-        !password ||
-        apt.companyId.toLowerCase() !== trimmedId ||
-        password !== apt.companyPassword
-      ) {
+      const passwordMatches =
+        Boolean(apt) &&
+        Boolean(trimmedPassword) &&
+        (rawPassword === apt!.companyPassword ||
+          trimmedPassword === apt!.companyPassword.trim());
+
+      if (!apt || apt.companyId.toLowerCase() !== trimmedId || !passwordMatches) {
         res.status(401).json({
           error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
         });
         return;
       }
 
-      const token = crypto.randomBytes(24).toString('hex');
+      const token = createSignedToken(apt.id, false, false);
       const nowIso = new Date().toISOString();
       store.sessions[token] = {
         token,
         apartmentId: apt.id,
         isAdmin: false,
+        isMaster: false,
         createdAt: nowIso,
         lastSeenAt: nowIso,
       };
@@ -1517,6 +1652,7 @@ export function createApp(): express.Express {
         token,
         authenticated: true,
         isAdmin: false,
+        isMaster: false,
         companyId: apt.companyId,
         apartmentId: apt.id,
         apartmentName: apt.name,
@@ -1554,7 +1690,10 @@ export function createApp(): express.Express {
     asyncHandler(async (req: AuthedRequest, res: Response) => {
       const { adminPassword } = req.body as { adminPassword?: string };
       const apartmentId = req.session!.apartmentId;
-      const token = req.session!.token;
+      const oldToken = req.session!.token;
+      const isMaster = Boolean(req.session!.isMaster);
+      const rawPw = adminPassword || '';
+      const trimmedPw = rawPw.trim();
 
       if (USE_POSTGRES) {
         await ensurePgReady();
@@ -1564,32 +1703,50 @@ export function createApp(): express.Express {
           [apartmentId]
         );
         const aptRow = aptRes.rows[0];
+        const expectedPw = aptRow ? String(aptRow.admin_password) : '';
         if (
           !aptRow ||
-          !adminPassword ||
-          adminPassword !== String(aptRow.admin_password)
+          !trimmedPw ||
+          (rawPw !== expectedPw && trimmedPw !== expectedPw.trim())
         ) {
           res.status(401).json({ error: '관리자 비밀번호가 올바르지 않습니다.' });
           return;
         }
+        const nextToken = createSignedToken(apartmentId, true, isMaster);
+        const nowIso = new Date().toISOString();
+        await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
         await pool.query(
-          'UPDATE sessions SET is_admin = TRUE, last_seen_at = $1 WHERE token = $2',
-          [new Date().toISOString(), token]
+          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [nextToken, apartmentId, true, isMaster, nowIso, nowIso]
         );
-        res.json({ isAdmin: true });
+        res.json({ isAdmin: true, isMaster, token: nextToken });
         return;
       }
 
       const store = readStore();
       const apt = store.apartments.find((a) => a.id === apartmentId);
-      if (!apt || !adminPassword || adminPassword !== apt.adminPassword) {
+      if (
+        !apt ||
+        !trimmedPw ||
+        (rawPw !== apt.adminPassword && trimmedPw !== apt.adminPassword.trim())
+      ) {
         res.status(401).json({ error: '관리자 비밀번호가 올바르지 않습니다.' });
         return;
       }
-      store.sessions[token].isAdmin = true;
-      store.sessions[token].lastSeenAt = new Date().toISOString();
+      const nextToken = createSignedToken(apartmentId, true, isMaster);
+      const nowIso = new Date().toISOString();
+      delete store.sessions[oldToken];
+      store.sessions[nextToken] = {
+        token: nextToken,
+        apartmentId,
+        isAdmin: true,
+        isMaster,
+        createdAt: req.session!.createdAt || nowIso,
+        lastSeenAt: nowIso,
+      };
       writeStore(store);
-      res.json({ isAdmin: true });
+      res.json({ isAdmin: true, isMaster, token: nextToken });
     })
   );
 
@@ -1597,22 +1754,91 @@ export function createApp(): express.Express {
     '/api/auth/admin/lock',
     requireAuth,
     asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const token = req.session!.token;
+      const oldToken = req.session!.token;
+      const apartmentId = req.session!.apartmentId;
+      const isMaster = Boolean(req.session!.isMaster);
+      const nextToken = createSignedToken(apartmentId, false, isMaster);
+      const nowIso = new Date().toISOString();
+
       if (USE_POSTGRES) {
         await ensurePgReady();
-        await getPgPool().query(
-          'UPDATE sessions SET is_admin = FALSE WHERE token = $1',
-          [token]
+        const pool = getPgPool();
+        await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
+        await pool.query(
+          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [nextToken, apartmentId, false, isMaster, nowIso, nowIso]
         );
-        res.json({ isAdmin: false });
+        res.json({ isAdmin: false, isMaster, token: nextToken });
         return;
       }
       const store = readStore();
-      if (store.sessions[token]) {
-        store.sessions[token].isAdmin = false;
+      delete store.sessions[oldToken];
+      store.sessions[nextToken] = {
+        token: nextToken,
+        apartmentId,
+        isAdmin: false,
+        isMaster,
+        createdAt: req.session!.createdAt || nowIso,
+        lastSeenAt: nowIso,
+      };
+      writeStore(store);
+      res.json({ isAdmin: false, isMaster, token: nextToken });
+    })
+  );
+
+  // Platform-wide Master Ad Control unlock
+  app.post(
+    '/api/auth/master/unlock',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { masterPassword } = req.body as { masterPassword?: string };
+      const expectedMaster = (
+        process.env.MASTER_ADMIN_PASSWORD || 'master7777'
+      ).trim();
+      const rawPw = masterPassword || '';
+      const trimmedPw = rawPw.trim();
+
+      if (
+        !trimmedPw ||
+        (rawPw !== expectedMaster && trimmedPw !== expectedMaster)
+      ) {
+        res
+          .status(401)
+          .json({ error: '통합 광고 마스터 비밀번호가 올바르지 않습니다.' });
+        return;
+      }
+
+      const oldToken = req.session!.token;
+      const apartmentId = req.session!.apartmentId;
+      const nextToken = createSignedToken(apartmentId, true, true);
+      const nowIso = new Date().toISOString();
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
+        await pool.query(
+          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [nextToken, apartmentId, true, true, nowIso, nowIso]
+        );
+      } else {
+        const store = readStore();
+        delete store.sessions[oldToken];
+        store.sessions[nextToken] = {
+          token: nextToken,
+          apartmentId,
+          isAdmin: true,
+          isMaster: true,
+          createdAt: req.session!.createdAt || nowIso,
+          lastSeenAt: nowIso,
+        };
         writeStore(store);
       }
-      res.json({ isAdmin: false });
+
+      res.json({ isMaster: true, token: nextToken });
     })
   );
 
@@ -2911,129 +3137,95 @@ export function createApp(): express.Express {
     })
   );
 
-  // External Bottom Ad Slot
-  app.get(
-    '/api/ad-slot',
-    requireAuth,
-    asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const apartmentId = req.session!.apartmentId;
-      if (USE_POSTGRES) {
-        await ensurePgReady();
-        const found = await getPgPool().query(
-          'SELECT * FROM external_ads WHERE apartment_id = $1 LIMIT 1',
-          [apartmentId]
-        );
-        const adSlot = found.rows[0]
-          ? mapExternalAdRow(found.rows[0])
-          : createDefaultExternalAd(apartmentId);
-        res.json({ adSlot });
-        return;
-      }
+  function validateAndBuildAdRecord(
+    targetApartmentId: string,
+    body: {
+      mode?: AdSlotMode;
+      sponsorName?: string;
+      headline?: string;
+      description?: string;
+      imageUrl?: string;
+      imageBase64?: string | null;
+      linkUrl?: string;
+      ctaLabel?: string;
+      contactInfo?: string;
+      adsenseClientId?: string;
+      adsenseSlotId?: string;
+      adfitUnitId?: string;
+    }
+  ): { record?: ExternalAdRecord; error?: string } {
+    const validModes: AdSlotMode[] = [
+      'inquiry',
+      'custom',
+      'adsense',
+      'adfit',
+      'hidden',
+    ];
+    const cleanMode: AdSlotMode =
+      body.mode && validModes.includes(body.mode) ? body.mode : 'inquiry';
 
-      const store = readStore();
-      const adSlot =
-        store.externalAds?.[apartmentId] || createDefaultExternalAd(apartmentId);
-      res.json({ adSlot });
-    })
-  );
-
-  app.put(
-    '/api/ad-slot',
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const apartmentId = req.session!.apartmentId;
-      const body = req.body as {
-        mode?: AdSlotMode;
-        sponsorName?: string;
-        headline?: string;
-        description?: string;
-        imageUrl?: string;
-        imageBase64?: string | null;
-        linkUrl?: string;
-        ctaLabel?: string;
-        contactInfo?: string;
-        adsenseClientId?: string;
-        adsenseSlotId?: string;
-        adfitUnitId?: string;
+    const rawLink = (body.linkUrl || '').trim();
+    const safeLink = sanitizeExternalHttpUrl(rawLink);
+    if (rawLink && !safeLink) {
+      return {
+        error: '연결 링크 URL은 http:// 또는 https://로 시작해야 합니다.',
       };
+    }
 
-      const validModes: AdSlotMode[] = [
-        'inquiry',
-        'custom',
-        'adsense',
-        'adfit',
-        'hidden',
-      ];
-      const cleanMode: AdSlotMode =
-        body.mode && validModes.includes(body.mode) ? body.mode : 'inquiry';
-
-      const rawLink = (body.linkUrl || '').trim();
-      const safeLink = sanitizeExternalHttpUrl(rawLink);
-      if (rawLink && !safeLink) {
-        res.status(400).json({
-          error: '연결 링크 URL은 http:// 또는 https://로 시작해야 합니다.',
-        });
-        return;
+    let resolvedImageUrl = '';
+    if (body.imageBase64) {
+      try {
+        resolvedImageUrl = saveBase64Photo(body.imageBase64) || '';
+      } catch (err) {
+        return {
+          error:
+            err instanceof Error
+              ? err.message
+              : '광고 이미지를 처리하는 중 오류가 발생했습니다.',
+        };
       }
-
-      let resolvedImageUrl = '';
-      if (body.imageBase64) {
-        try {
-          resolvedImageUrl = saveBase64Photo(body.imageBase64) || '';
-        } catch (err) {
-          res.status(400).json({
-            error:
-              err instanceof Error
-                ? err.message
-                : '광고 이미지를 처리하는 중 오류가 발생했습니다.',
-          });
-          return;
-        }
-      } else if (body.imageUrl) {
-        const trimmedImg = body.imageUrl.trim();
-        if (
-          trimmedImg.startsWith('/api/uploads/') ||
-          trimmedImg.startsWith('/src/assets/') ||
-          /^https?:\/\//i.test(trimmedImg) ||
-          /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(trimmedImg)
-        ) {
-          resolvedImageUrl = trimmedImg;
-        } else {
-          res.status(400).json({
-            error:
-              '이미지 URL은 http(s):// 주소이거나 업로드된 이미지여야 합니다.',
-          });
-          return;
-        }
+    } else if (body.imageUrl) {
+      const trimmedImg = body.imageUrl.trim();
+      if (
+        trimmedImg.startsWith('/api/uploads/') ||
+        trimmedImg.startsWith('/src/assets/') ||
+        /^https?:\/\//i.test(trimmedImg) ||
+        /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(trimmedImg)
+      ) {
+        resolvedImageUrl = trimmedImg;
+      } else {
+        return {
+          error:
+            '이미지 URL은 http(s):// 주소이거나 업로드된 이미지여야 합니다.',
+        };
       }
+    }
 
-      const cleanHeadline = (body.headline || '').trim().slice(0, 80);
-      const cleanAdsenseClient = (body.adsenseClientId || '').trim().slice(0, 40);
-      const cleanAdsenseSlot = (body.adsenseSlotId || '').trim().slice(0, 40);
-      const cleanAdfitUnit = (body.adfitUnitId || '').trim().slice(0, 40);
+    const cleanHeadline = (body.headline || '').trim().slice(0, 80);
+    const cleanAdsenseClient = (body.adsenseClientId || '').trim().slice(0, 40);
+    const cleanAdsenseSlot = (body.adsenseSlotId || '').trim().slice(0, 40);
+    const cleanAdfitUnit = (body.adfitUnitId || '').trim().slice(0, 40);
 
-      if (cleanMode === 'custom' && !cleanHeadline && !resolvedImageUrl) {
-        res.status(400).json({
-          error: '직접 배너 모드에서는 광고 제목 또는 배너 이미지를 입력해 주세요.',
-        });
-        return;
-      }
-      if (cleanMode === 'adsense' && (!cleanAdsenseClient || !cleanAdsenseSlot)) {
-        res.status(400).json({
-          error: 'Google AdSense 클라이언트 ID(ca-pub-...)와 슬롯 ID를 모두 입력해 주세요.',
-        });
-        return;
-      }
-      if (cleanMode === 'adfit' && !cleanAdfitUnit) {
-        res.status(400).json({
-          error: '카카오 애드핏 광고 단위 ID(DAN-...)를 입력해 주세요.',
-        });
-        return;
-      }
+    if (cleanMode === 'custom' && !cleanHeadline && !resolvedImageUrl) {
+      return {
+        error: '직접 배너 모드에서는 광고 제목 또는 배너 이미지를 입력해 주세요.',
+      };
+    }
+    if (cleanMode === 'adsense' && (!cleanAdsenseClient || !cleanAdsenseSlot)) {
+      return {
+        error:
+          'Google AdSense 클라이언트 ID(ca-pub-...)와 슬롯 ID를 모두 입력해 주세요.',
+      };
+    }
+    if (cleanMode === 'adfit' && !cleanAdfitUnit) {
+      return {
+        error: '카카오 애드핏 광고 단위 ID(DAN-...)를 입력해 주세요.',
+      };
+    }
 
-      const nextRecord: ExternalAdRecord = {
-        apartmentId,
+    return {
+      record: {
+        apartmentId: targetApartmentId,
         mode: cleanMode,
         sponsorName: (body.sponsorName || '').trim().slice(0, 40),
         headline: cleanHeadline,
@@ -3046,11 +3238,70 @@ export function createApp(): express.Express {
         adsenseSlotId: cleanAdsenseSlot,
         adfitUnitId: cleanAdfitUnit,
         updatedAt: new Date().toISOString(),
-      };
+      },
+    };
+  }
+
+  // External Bottom Ad Slot (supports Global Shared Ad + Apartment Override)
+  app.get(
+    '/api/ad-slot',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        const [aptFound, globalFound] = await Promise.all([
+          pool.query('SELECT * FROM external_ads WHERE apartment_id = $1 LIMIT 1', [
+            apartmentId,
+          ]),
+          pool.query('SELECT * FROM global_ad_slot WHERE id = $1 LIMIT 1', [
+            'default',
+          ]),
+        ]);
+        const globalAdSlot = globalFound.rows[0]
+          ? mapExternalAdRow({
+              ...globalFound.rows[0],
+              apartment_id: '__global__',
+            })
+          : createDefaultExternalAd('__global__');
+        const hasApartmentOverride = aptFound.rows.length > 0;
+        const adSlot = hasApartmentOverride
+          ? mapExternalAdRow(aptFound.rows[0])
+          : { ...globalAdSlot, apartmentId };
+        res.json({ adSlot, globalAdSlot, hasApartmentOverride });
+        return;
+      }
+
+      const store = readStore();
+      const globalAdSlot =
+        store.globalAd || createDefaultExternalAd('__global__');
+      const aptOverride = store.externalAds?.[apartmentId];
+      const hasApartmentOverride = Boolean(aptOverride);
+      const adSlot = aptOverride || { ...globalAdSlot, apartmentId };
+      res.json({ adSlot, globalAdSlot, hasApartmentOverride });
+    })
+  );
+
+  app.put(
+    '/api/ad-slot',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      const { record, error } = validateAndBuildAdRecord(
+        apartmentId,
+        req.body as Parameters<typeof validateAndBuildAdRecord>[1]
+      );
+      if (error || !record) {
+        res.status(400).json({ error: error || '광고 설정이 올바르지 않습니다.' });
+        return;
+      }
 
       if (USE_POSTGRES) {
         await ensurePgReady();
-        await getPgPool().query(
+        const pool = getPgPool();
+        await pool.query(
           `INSERT INTO external_ads (
             apartment_id, mode, sponsor_name, headline, description, image_url, link_url,
             cta_label, contact_info, adsense_client_id, adsense_slot_id, adfit_unit_id, updated_at
@@ -3069,35 +3320,210 @@ export function createApp(): express.Express {
             adfit_unit_id = EXCLUDED.adfit_unit_id,
             updated_at = EXCLUDED.updated_at`,
           [
-            nextRecord.apartmentId,
-            nextRecord.mode,
-            nextRecord.sponsorName,
-            nextRecord.headline,
-            nextRecord.description,
-            nextRecord.imageUrl,
-            nextRecord.linkUrl,
-            nextRecord.ctaLabel,
-            nextRecord.contactInfo,
-            nextRecord.adsenseClientId,
-            nextRecord.adsenseSlotId,
-            nextRecord.adfitUnitId,
-            nextRecord.updatedAt,
+            record.apartmentId,
+            record.mode,
+            record.sponsorName,
+            record.headline,
+            record.description,
+            record.imageUrl,
+            record.linkUrl,
+            record.ctaLabel,
+            record.contactInfo,
+            record.adsenseClientId,
+            record.adsenseSlotId,
+            record.adfitUnitId,
+            record.updatedAt,
           ]
         );
-      } else {
-        const store = readStore();
-        if (!store.externalAds || typeof store.externalAds !== 'object') {
-          store.externalAds = {};
-        }
-        const prevImg = store.externalAds[apartmentId]?.imageUrl;
-        if (prevImg && prevImg !== resolvedImageUrl) {
-          deleteUploadedPhotoIfLocal(prevImg);
-        }
-        store.externalAds[apartmentId] = nextRecord;
-        writeStore(store);
+        const globalFound = await pool.query(
+          'SELECT * FROM global_ad_slot WHERE id = $1 LIMIT 1',
+          ['default']
+        );
+        const globalAdSlot = globalFound.rows[0]
+          ? mapExternalAdRow({
+              ...globalFound.rows[0],
+              apartment_id: '__global__',
+            })
+          : createDefaultExternalAd('__global__');
+        res.json({
+          adSlot: record,
+          globalAdSlot,
+          hasApartmentOverride: true,
+        });
+        return;
       }
 
-      res.json({ adSlot: nextRecord });
+      const store = readStore();
+      if (!store.externalAds || typeof store.externalAds !== 'object') {
+        store.externalAds = {};
+      }
+      const prevImg = store.externalAds[apartmentId]?.imageUrl;
+      if (prevImg && prevImg !== record.imageUrl) {
+        deleteUploadedPhotoIfLocal(prevImg);
+      }
+      store.externalAds[apartmentId] = record;
+      writeStore(store);
+
+      const globalAdSlot =
+        store.globalAd || createDefaultExternalAd('__global__');
+      res.json({ adSlot: record, globalAdSlot, hasApartmentOverride: true });
+    })
+  );
+
+  app.delete(
+    '/api/ad-slot/override',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        await pool.query('DELETE FROM external_ads WHERE apartment_id = $1', [
+          apartmentId,
+        ]);
+        const globalFound = await pool.query(
+          'SELECT * FROM global_ad_slot WHERE id = $1 LIMIT 1',
+          ['default']
+        );
+        const globalAdSlot = globalFound.rows[0]
+          ? mapExternalAdRow({
+              ...globalFound.rows[0],
+              apartment_id: '__global__',
+            })
+          : createDefaultExternalAd('__global__');
+        res.json({
+          adSlot: { ...globalAdSlot, apartmentId },
+          globalAdSlot,
+          hasApartmentOverride: false,
+        });
+        return;
+      }
+
+      const store = readStore();
+      if (store.externalAds?.[apartmentId]) {
+        deleteUploadedPhotoIfLocal(store.externalAds[apartmentId].imageUrl);
+        delete store.externalAds[apartmentId];
+        writeStore(store);
+      }
+      const globalAdSlot =
+        store.globalAd || createDefaultExternalAd('__global__');
+      res.json({
+        adSlot: { ...globalAdSlot, apartmentId },
+        globalAdSlot,
+        hasApartmentOverride: false,
+      });
+    })
+  );
+
+  app.put(
+    '/api/ad-slot/global',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      if (!req.session?.isMaster) {
+        res.status(403).json({
+          error: '전체 단지 공통 광고를 수정하려면 마스터 비밀번호 인증이 필요합니다.',
+        });
+        return;
+      }
+
+      const body = req.body as Parameters<typeof validateAndBuildAdRecord>[1] & {
+        applyToAll?: boolean;
+      };
+      const { record, error } = validateAndBuildAdRecord('__global__', body);
+      if (error || !record) {
+        res.status(400).json({ error: error || '광고 설정이 올바르지 않습니다.' });
+        return;
+      }
+
+      const applyToAll = body.applyToAll !== false;
+      const apartmentId = req.session.apartmentId;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const pool = getPgPool();
+        await pool.query(
+          `INSERT INTO global_ad_slot (
+            id, mode, sponsor_name, headline, description, image_url, link_url,
+            cta_label, contact_info, adsense_client_id, adsense_slot_id, adfit_unit_id, updated_at
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+          ON CONFLICT (id) DO UPDATE SET
+            mode = EXCLUDED.mode,
+            sponsor_name = EXCLUDED.sponsor_name,
+            headline = EXCLUDED.headline,
+            description = EXCLUDED.description,
+            image_url = EXCLUDED.image_url,
+            link_url = EXCLUDED.link_url,
+            cta_label = EXCLUDED.cta_label,
+            contact_info = EXCLUDED.contact_info,
+            adsense_client_id = EXCLUDED.adsense_client_id,
+            adsense_slot_id = EXCLUDED.adsense_slot_id,
+            adfit_unit_id = EXCLUDED.adfit_unit_id,
+            updated_at = EXCLUDED.updated_at`,
+          [
+            'default',
+            record.mode,
+            record.sponsorName,
+            record.headline,
+            record.description,
+            record.imageUrl,
+            record.linkUrl,
+            record.ctaLabel,
+            record.contactInfo,
+            record.adsenseClientId,
+            record.adsenseSlotId,
+            record.adfitUnitId,
+            record.updatedAt,
+          ]
+        );
+        if (applyToAll) {
+          await pool.query('DELETE FROM external_ads');
+        }
+        const aptFound = applyToAll
+          ? { rows: [] }
+          : await pool.query(
+              'SELECT * FROM external_ads WHERE apartment_id = $1 LIMIT 1',
+              [apartmentId]
+            );
+        const hasApartmentOverride = aptFound.rows.length > 0;
+        const effectiveAd = hasApartmentOverride
+          ? mapExternalAdRow(aptFound.rows[0])
+          : { ...record, apartmentId };
+        res.json({
+          adSlot: effectiveAd,
+          globalAdSlot: record,
+          hasApartmentOverride,
+        });
+        return;
+      }
+
+      const store = readStore();
+      const prevGlobalImg = store.globalAd?.imageUrl;
+      if (prevGlobalImg && prevGlobalImg !== record.imageUrl) {
+        deleteUploadedPhotoIfLocal(prevGlobalImg);
+      }
+      store.globalAd = record;
+      if (applyToAll) {
+        if (store.externalAds) {
+          for (const item of Object.values(store.externalAds)) {
+            if (item.imageUrl && item.imageUrl !== record.imageUrl) {
+              deleteUploadedPhotoIfLocal(item.imageUrl);
+            }
+          }
+        }
+        store.externalAds = {};
+      }
+      writeStore(store);
+
+      const aptOverride = store.externalAds?.[apartmentId];
+      const hasApartmentOverride = Boolean(aptOverride);
+      res.json({
+        adSlot: aptOverride || { ...record, apartmentId },
+        globalAdSlot: record,
+        hasApartmentOverride,
+      });
     })
   );
 
@@ -3262,6 +3688,19 @@ export function createApp(): express.Express {
   app.use(
     (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
       console.error('API Error:', err);
+      const message = err instanceof Error ? err.message : String(err || '');
+      if (
+        USE_POSTGRES &&
+        /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|password authentication failed|database .* does not exist|no pg_hba\.conf|SSL|certificate|connection terminated/i.test(
+          message
+        )
+      ) {
+        res.status(503).json({
+          error:
+            '클라우드 DB 연결에 실패했습니다. Vercel 환경 변수(DATABASE_URL) 주소를 확인한 뒤 다시 배포해 주세요.',
+        });
+        return;
+      }
       res.status(500).json({
         error: '서버 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
       });
