@@ -3959,36 +3959,39 @@ export const app = createApp();
 export function handleVercelApi(req: Request, res: Response): void {
   try {
     const rawUrl = req.url || '/';
-    const originalUrlHeader =
-      (req.headers['x-vercel-original-url'] as string | undefined) ||
-      (req.headers['x-forwarded-uri'] as string | undefined) ||
-      (req.headers['x-rewrite-url'] as string | undefined);
+    const qIdx = rawUrl.indexOf('?');
+    const searchParams =
+      qIdx !== -1 ? new URLSearchParams(rawUrl.slice(qIdx + 1)) : null;
+    const rewrittenPath =
+      searchParams?.get('__path') ??
+      searchParams?.get('...path') ??
+      searchParams?.get('path') ??
+      null;
 
-    if (
-      originalUrlHeader &&
-      originalUrlHeader.startsWith('/api/') &&
-      !originalUrlHeader.startsWith('/api/index')
-    ) {
-      req.url = originalUrlHeader;
-    } else if (
-      rawUrl === '/api/index' ||
-      rawUrl.startsWith('/api/index?') ||
-      rawUrl.startsWith('/api/[...path]')
-    ) {
-      const qIdx = rawUrl.indexOf('?');
-      if (qIdx !== -1) {
-        const params = new URLSearchParams(rawUrl.slice(qIdx + 1));
-        const dynamicPath = params.get('...path') || params.get('path');
-        if (dynamicPath) {
-          params.delete('...path');
-          params.delete('path');
-          const rest = params.toString();
-          const normalizedSubpath = dynamicPath.replace(/^\/+/, '');
-          req.url = `/api/${normalizedSubpath}${rest ? `?${rest}` : ''}`;
-        }
+    if (rewrittenPath !== null && searchParams) {
+      searchParams.delete('__path');
+      searchParams.delete('...path');
+      searchParams.delete('path');
+      const rest = searchParams.toString();
+      const normalizedSubpath = rewrittenPath.replace(/^\/+/, '');
+      req.url = `/api${normalizedSubpath ? `/${normalizedSubpath}` : ''}${rest ? `?${rest}` : ''}`;
+    } else {
+      const originalUrlHeader =
+        (req.headers['x-vercel-original-url'] as string | undefined) ||
+        (req.headers['x-forwarded-uri'] as string | undefined) ||
+        (req.headers['x-rewrite-url'] as string | undefined);
+
+      if (
+        originalUrlHeader &&
+        originalUrlHeader.startsWith('/api/') &&
+        !originalUrlHeader.startsWith('/api/index')
+      ) {
+        req.url = originalUrlHeader;
+      } else if (!rawUrl.startsWith('/api')) {
+        req.url = `/api${rawUrl.startsWith('/') ? '' : '/'}${rawUrl}`;
+      } else if (rawUrl === '/api/index' || rawUrl.startsWith('/api/index?')) {
+        req.url = `/api${qIdx !== -1 ? rawUrl.slice(qIdx) : ''}`;
       }
-    } else if (!rawUrl.startsWith('/api')) {
-      req.url = `/api${rawUrl.startsWith('/') ? '' : '/'}${rawUrl}`;
     }
 
     app(req, res);
@@ -3996,6 +3999,7 @@ export function handleVercelApi(req: Request, res: Response): void {
     console.error('Vercel API invocation error:', err);
     if (!res.headersSent) {
       res.status(500).json({
+        code: 'VERCEL_HANDLER_ERROR',
         error: '서버 API 초기화 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
       });
     }
