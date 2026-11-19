@@ -277,17 +277,23 @@ export default function App() {
   }, [checkSession]);
 
   const handleWorkersReplaced = useCallback(
-    (nextWorkers: Worker[]) => {
-      setWorkers(nextWorkers);
-      if (storageMode === 'memory' && session?.apartmentId) {
-        setStoredMemoryWorkers(session.apartmentId, nextWorkers);
-      }
-      setSelectedWorkerId((prev) => {
-        if (prev && nextWorkers.some((w) => w.id === prev)) {
-          return prev;
+    (nextOrUpdater: Worker[] | ((prev: Worker[]) => Worker[])) => {
+      setWorkers((prev) => {
+        const nextWorkers =
+          typeof nextOrUpdater === 'function'
+            ? nextOrUpdater(prev)
+            : nextOrUpdater;
+        if (storageMode === 'memory' && session?.apartmentId) {
+          setStoredMemoryWorkers(session.apartmentId, nextWorkers);
         }
-        setStoredWorkerId('');
-        return '';
+        setSelectedWorkerId((currentId) => {
+          if (currentId && nextWorkers.some((w) => w.id === currentId)) {
+            return currentId;
+          }
+          setStoredWorkerId('');
+          return '';
+        });
+        return nextWorkers;
       });
     },
     [storageMode, session?.apartmentId]

@@ -56,7 +56,9 @@ interface AdminPanelProps {
   onMasterStateChanged: (isMaster: boolean) => void;
   onApartmentUpdated: (apt: Apartment) => void;
   onWorkersChanged: () => void;
-  onWorkersReplaced: (next: Worker[]) => void;
+  onWorkersReplaced: (
+    nextOrUpdater: Worker[] | ((prev: Worker[]) => Worker[])
+  ) => void;
   onBannersChanged: (next: EventBanner[]) => void;
   onAdStateChanged: (next: AdSlotStateResponse) => void;
   onEditLog: (log: WorkLog) => void;
@@ -100,6 +102,7 @@ export function AdminPanel({
   const [workerLoading, setWorkerLoading] = useState(false);
   const [removingWorkerId, setRemovingWorkerId] = useState<string | null>(null);
   const [workerError, setWorkerError] = useState<string | null>(null);
+  const [workerSuccess, setWorkerSuccess] = useState<string | null>(null);
   const [confirmRemoveWorkerId, setConfirmRemoveWorkerId] = useState<string | null>(
     null
   );
@@ -201,6 +204,7 @@ export function AdminPanel({
     }
 
     setWorkerError(null);
+    setWorkerSuccess(null);
     setWorkerLoading(true);
     try {
       const res = await apiFetch<{
@@ -219,14 +223,19 @@ export function AdminPanel({
 
       const activeMode = res.storage || storageMode;
       if (activeMode === 'memory') {
-        const nextWorkers = [...workers, res.worker];
-        setStoredMemoryWorkers(apartmentId, nextWorkers);
-        onWorkersReplaced(nextWorkers);
+        onWorkersReplaced((prev) => {
+          const nextWorkers = prev.some((w) => w.id === res.worker.id)
+            ? prev
+            : [...prev, res.worker];
+          setStoredMemoryWorkers(apartmentId, nextWorkers);
+          return nextWorkers;
+        });
       } else if (Array.isArray(res.workers)) {
         onWorkersReplaced(res.workers);
       } else {
         onWorkersChanged();
       }
+      setWorkerSuccess(`'${res.worker.name}' 직원이 등록되었습니다.`);
     } catch (err) {
       setWorkerError(
         err instanceof Error ? err.message : '직원 등록에 실패했습니다.'
@@ -238,6 +247,7 @@ export function AdminPanel({
 
   const handleRemoveWorker = async (id: string) => {
     setWorkerError(null);
+    setWorkerSuccess(null);
     setRemovingWorkerId(id);
     try {
       const res = await apiFetch<{
@@ -245,19 +255,25 @@ export function AdminPanel({
         deletedId?: string;
         workers?: Worker[];
         storage?: StorageMode;
-      }>(`/api/workers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      }>('/api/workers/delete', {
+        method: 'POST',
+        body: JSON.stringify({ id }),
+      });
       setConfirmRemoveWorkerId(null);
 
       const activeMode = res.storage || storageMode;
       if (activeMode === 'memory') {
-        const nextWorkers = workers.filter((w) => w.id !== id);
-        setStoredMemoryWorkers(apartmentId, nextWorkers);
-        onWorkersReplaced(nextWorkers);
+        onWorkersReplaced((prev) => {
+          const nextWorkers = prev.filter((w) => w.id !== id);
+          setStoredMemoryWorkers(apartmentId, nextWorkers);
+          return nextWorkers;
+        });
       } else if (Array.isArray(res.workers)) {
         onWorkersReplaced(res.workers);
       } else {
         onWorkersChanged();
       }
+      setWorkerSuccess('직원 명단에서 삭제되었습니다.');
     } catch (err) {
       setWorkerError(
         err instanceof Error ? err.message : '직원 삭제에 실패했습니다.'
@@ -641,6 +657,16 @@ export function AdminPanel({
               className="mb-3 p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium"
             >
               {workerError}
+            </div>
+          )}
+
+          {workerSuccess && (
+            <div
+              role="status"
+              className="mb-3 p-3 rounded-xl bg-teal-50 border border-teal-200 text-xs text-teal-800 font-medium flex items-center gap-1.5"
+            >
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>{workerSuccess}</span>
             </div>
           )}
 

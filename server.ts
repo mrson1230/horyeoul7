@@ -1475,6 +1475,11 @@ export function createApp(): Express {
   });
 
   app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    res.setHeader(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, proxy-revalidate'
+    );
+    res.setHeader('Pragma', 'no-cache');
     const startedAt = Date.now();
     res.on('finish', () => {
       const durationMs = Date.now() - startedAt;
@@ -1483,7 +1488,7 @@ export function createApp(): Express {
         path: req.originalUrl || req.url,
         status: res.statusCode,
         durationMs,
-        storage: USE_POSTGRES ? 'postgres' : IS_VERCEL ? 'memory' : 'file',
+        storage: getStorageMode(),
       };
       if (res.statusCode >= 500) {
         console.error('[API Response 5xx]', logPayload);
@@ -2392,59 +2397,91 @@ export function createApp(): Express {
     })
   );
 
+  const handleDeleteWorkerRequest = async (
+    req: AuthedRequest,
+    res: Response,
+    rawId: string
+  ) => {
+    const id = decodeURIComponent(String(rawId || '')).trim();
+    const apartmentId = req.session!.apartmentId;
+
+    if (!id) {
+      res.status(400).json({ error: '삭제할 직원 ID가 올바르지 않습니다.' });
+      return;
+    }
+
+    if (USE_POSTGRES) {
+      await ensurePgReady();
+      const pool = getPgPool();
+      const result = await pool.query(
+        'DELETE FROM workers WHERE id = $1 AND apartment_id = $2 RETURNING id',
+        [id, apartmentId]
+      );
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
+        return;
+      }
+      const allRes = await pool.query(
+        'SELECT * FROM workers WHERE apartment_id = $1 ORDER BY created_at ASC',
+        [apartmentId]
+      );
+      res.json({
+        ok: true,
+        deletedId: id,
+        workers: allRes.rows.map(mapWorkerRow),
+        storage: 'postgres',
+      });
+      return;
+    }
+
+    const store = readStore();
+    const storageMode = getStorageMode();
+    const exists = store.workers.some(
+      (w) => w.id === id && w.apartmentId === apartmentId
+    );
+    if (!exists && storageMode !== 'memory') {
+      res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
+      return;
+    }
+    if (exists) {
+      store.workers = store.workers.filter(
+        (w) => !(w.id === id && w.apartmentId === apartmentId)
+      );
+      writeStore(store);
+    }
+    res.json({
+      ok: true,
+      deletedId: id,
+      workers: store.workers.filter((w) => w.apartmentId === apartmentId),
+      storage: storageMode,
+    });
+  };
+
+  app.post(
+    '/api/workers/delete',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = (req.body || {}) as { id?: string };
+      await handleDeleteWorkerRequest(req, res, id || '');
+    })
+  );
+
+  app.post(
+    '/api/workers/:id/delete',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      await handleDeleteWorkerRequest(req, res, req.params.id || '');
+    })
+  );
+
   app.delete(
     '/api/workers/:id',
     requireAuth,
     requireAdmin,
     asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const id = decodeURIComponent(String(req.params.id || '')).trim();
-      const apartmentId = req.session!.apartmentId;
-
-      if (USE_POSTGRES) {
-        await ensurePgReady();
-        const pool = getPgPool();
-        const result = await pool.query(
-          'DELETE FROM workers WHERE id = $1 AND apartment_id = $2 RETURNING id',
-          [id, apartmentId]
-        );
-        if (result.rows.length === 0) {
-          res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
-          return;
-        }
-        const allRes = await pool.query(
-          'SELECT * FROM workers WHERE apartment_id = $1 ORDER BY created_at ASC',
-          [apartmentId]
-        );
-        res.json({
-          ok: true,
-          deletedId: id,
-          workers: allRes.rows.map(mapWorkerRow),
-          storage: 'postgres',
-        });
-        return;
-      }
-
-      const store = readStore();
-      const storageMode = getStorageMode();
-      const exists = store.workers.some(
-        (w) => w.id === id && w.apartmentId === apartmentId
-      );
-      if (!exists && storageMode !== 'memory') {
-        res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
-        return;
-      }
-      if (exists) {
-        store.workers = store.workers.filter(
-          (w) => !(w.id === id && w.apartmentId === apartmentId)
-        );
-        writeStore(store);
-      }
-      res.json({
-        ok: true,
-        deletedId: id,
-        workers: store.workers.filter((w) => w.apartmentId === apartmentId),
-        storage: storageMode,
-      });
+      await handleDeleteWorkerRequest(req, res, req.params.id || '');
     })
   );
 
