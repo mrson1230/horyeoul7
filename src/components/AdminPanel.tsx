@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import {
+  AlertTriangle,
   Building2,
   CheckCircle2,
   Download,
@@ -17,8 +18,10 @@ import {
   apiFetch,
   getStoredToken,
   getTodayKoreaDate,
+  setStoredMemoryWorkers,
   setStoredToken,
 } from '../utils/api';
+import type { StorageMode } from '../utils/api';
 import { AdSlotManagerSection } from './AdSlotManagerSection';
 import { BannerMakerSection } from './BannerMakerSection';
 import { WorkStatusLabel } from './WorkStatusLabel';
@@ -35,8 +38,10 @@ import type {
 interface AdminPanelProps {
   isAdmin: boolean;
   isMaster: boolean;
+  apartmentId: string;
   apartmentName: string;
   officeName: string;
+  storageMode: StorageMode | null;
   workers: Worker[];
   logs: WorkLog[];
   banners: EventBanner[];
@@ -51,6 +56,7 @@ interface AdminPanelProps {
   onMasterStateChanged: (isMaster: boolean) => void;
   onApartmentUpdated: (apt: Apartment) => void;
   onWorkersChanged: () => void;
+  onWorkersReplaced: (next: Worker[]) => void;
   onBannersChanged: (next: EventBanner[]) => void;
   onAdStateChanged: (next: AdSlotStateResponse) => void;
   onEditLog: (log: WorkLog) => void;
@@ -60,8 +66,10 @@ interface AdminPanelProps {
 export function AdminPanel({
   isAdmin,
   isMaster,
+  apartmentId,
   apartmentName,
   officeName,
+  storageMode,
   workers,
   logs,
   banners,
@@ -76,6 +84,7 @@ export function AdminPanel({
   onMasterStateChanged,
   onApartmentUpdated,
   onWorkersChanged,
+  onWorkersReplaced,
   onBannersChanged,
   onAdStateChanged,
   onEditLog,
@@ -89,6 +98,7 @@ export function AdminPanel({
   const [newWorkerName, setNewWorkerName] = useState('');
   const [newWorkerRole, setNewWorkerRole] = useState('');
   const [workerLoading, setWorkerLoading] = useState(false);
+  const [removingWorkerId, setRemovingWorkerId] = useState<string | null>(null);
   const [workerError, setWorkerError] = useState<string | null>(null);
   const [confirmRemoveWorkerId, setConfirmRemoveWorkerId] = useState<string | null>(
     null
@@ -179,19 +189,44 @@ export function AdminPanel({
 
   const handleAddWorker = async (e: FormEvent) => {
     e.preventDefault();
+    const trimmedName = newWorkerName.trim();
+    const trimmedRole = newWorkerRole.trim() || '직원';
+    if (!trimmedName) {
+      setWorkerError('직원 이름을 입력해 주세요.');
+      return;
+    }
+    if (workers.some((w) => w.name === trimmedName)) {
+      setWorkerError('이미 등록된 직원 이름입니다.');
+      return;
+    }
+
     setWorkerError(null);
     setWorkerLoading(true);
     try {
-      await apiFetch('/api/workers', {
+      const res = await apiFetch<{
+        worker: Worker;
+        workers?: Worker[];
+        storage?: StorageMode;
+      }>('/api/workers', {
         method: 'POST',
         body: JSON.stringify({
-          name: newWorkerName.trim(),
-          role: newWorkerRole.trim() || '직원',
+          name: trimmedName,
+          role: trimmedRole,
         }),
       });
       setNewWorkerName('');
       setNewWorkerRole('');
-      onWorkersChanged();
+
+      const activeMode = res.storage || storageMode;
+      if (activeMode === 'memory') {
+        const nextWorkers = [...workers, res.worker];
+        setStoredMemoryWorkers(apartmentId, nextWorkers);
+        onWorkersReplaced(nextWorkers);
+      } else if (Array.isArray(res.workers)) {
+        onWorkersReplaced(res.workers);
+      } else {
+        onWorkersChanged();
+      }
     } catch (err) {
       setWorkerError(
         err instanceof Error ? err.message : '직원 등록에 실패했습니다.'
@@ -203,14 +238,32 @@ export function AdminPanel({
 
   const handleRemoveWorker = async (id: string) => {
     setWorkerError(null);
+    setRemovingWorkerId(id);
     try {
-      await apiFetch(`/api/workers/${id}`, { method: 'DELETE' });
+      const res = await apiFetch<{
+        ok: boolean;
+        deletedId?: string;
+        workers?: Worker[];
+        storage?: StorageMode;
+      }>(`/api/workers/${encodeURIComponent(id)}`, { method: 'DELETE' });
       setConfirmRemoveWorkerId(null);
-      onWorkersChanged();
+
+      const activeMode = res.storage || storageMode;
+      if (activeMode === 'memory') {
+        const nextWorkers = workers.filter((w) => w.id !== id);
+        setStoredMemoryWorkers(apartmentId, nextWorkers);
+        onWorkersReplaced(nextWorkers);
+      } else if (Array.isArray(res.workers)) {
+        onWorkersReplaced(res.workers);
+      } else {
+        onWorkersChanged();
+      }
     } catch (err) {
       setWorkerError(
         err instanceof Error ? err.message : '직원 삭제에 실패했습니다.'
       );
+    } finally {
+      setRemovingWorkerId(null);
     }
   };
 
@@ -535,6 +588,25 @@ export function AdminPanel({
             여기서 등록한 직원 목록이 작업일지 작성 화면의 작업자 선택 목록에 즉시 반영됩니다.
           </p>
 
+          {storageMode === 'memory' && (
+            <div
+              role="status"
+              className="mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start gap-2 leading-relaxed"
+            >
+              <AlertTriangle
+                className="w-4 h-4 text-amber-600 shrink-0 mt-0.5"
+                aria-hidden="true"
+              />
+              <span>
+                현재 배포 서버가 <strong>임시 메모리 모드(DB 미연결)</strong>로 실행 중입니다. 이 브라우저에서는 등록·삭제가 유지되지만, 모든 직원 기기에서 영구 동기화하려면 배포 환경 변수에{' '}
+                <code className="px-1 py-0.5 bg-amber-100 rounded font-mono text-[11px]">
+                  DATABASE_URL
+                </code>
+                (PostgreSQL)을 연결해 주세요.
+              </span>
+            </div>
+          )}
+
           <form onSubmit={handleAddWorker} className="flex flex-col sm:flex-row gap-2 mb-4">
             <input
               type="text"
@@ -559,7 +631,7 @@ export function AdminPanel({
               className="min-h-[48px] sm:min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-sm font-semibold rounded-xl flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
             >
               <UserPlus className="w-4 h-4" aria-hidden="true" />
-              <span>등록</span>
+              <span>{workerLoading ? '등록 중...' : '등록'}</span>
             </button>
           </form>
 
@@ -595,15 +667,17 @@ export function AdminPanel({
                     <div className="flex items-center gap-1.5">
                       <button
                         type="button"
+                        disabled={removingWorkerId === worker.id}
                         onClick={() => handleRemoveWorker(worker.id)}
-                        className="min-h-[44px] px-3 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg whitespace-nowrap"
+                        className="min-h-[44px] px-3 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-lg whitespace-nowrap"
                       >
-                        삭제 확인
+                        {removingWorkerId === worker.id ? '삭제 중...' : '삭제 확인'}
                       </button>
                       <button
                         type="button"
+                        disabled={removingWorkerId === worker.id}
                         onClick={() => setConfirmRemoveWorkerId(null)}
-                        className="min-h-[44px] px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-lg whitespace-nowrap"
+                        className="min-h-[44px] px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-60 rounded-lg whitespace-nowrap"
                       >
                         취소
                       </button>

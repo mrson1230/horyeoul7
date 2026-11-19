@@ -26,11 +26,14 @@ import { WorkLogComposer } from './components/WorkLogComposer';
 import { WorkLogFeed } from './components/WorkLogFeed';
 import {
   apiFetch,
+  getStoredMemoryWorkers,
   getStoredToken,
   getStoredWorkerId,
+  setStoredMemoryWorkers,
   setStoredToken,
   setStoredWorkerId,
 } from './utils/api';
+import type { StorageMode } from './utils/api';
 import {
   getBrowserNotificationPermission,
   getSeenUrgentIds,
@@ -109,6 +112,7 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('workspace');
   const [workers, setWorkers] = useState<Worker[]>([]);
+  const [storageMode, setStorageMode] = useState<StorageMode | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string>(
     getStoredWorkerId()
   );
@@ -272,13 +276,48 @@ export default function App() {
     void checkSession();
   }, [checkSession]);
 
+  const handleWorkersReplaced = useCallback(
+    (nextWorkers: Worker[]) => {
+      setWorkers(nextWorkers);
+      if (storageMode === 'memory' && session?.apartmentId) {
+        setStoredMemoryWorkers(session.apartmentId, nextWorkers);
+      }
+      setSelectedWorkerId((prev) => {
+        if (prev && nextWorkers.some((w) => w.id === prev)) {
+          return prev;
+        }
+        setStoredWorkerId('');
+        return '';
+      });
+    },
+    [storageMode, session?.apartmentId]
+  );
+
   const fetchWorkers = useCallback(async () => {
     if (!session?.authenticated) return;
     try {
-      const res = await apiFetch<{ workers: Worker[] }>('/api/workers');
-      setWorkers(res.workers);
+      const res = await apiFetch<{
+        workers: Worker[];
+        storage?: StorageMode;
+      }>('/api/workers');
+      const mode = res.storage || null;
+      if (mode) {
+        setStorageMode(mode);
+      }
+
+      let resolvedWorkers = res.workers;
+      if (mode === 'memory' && session.apartmentId) {
+        const saved = getStoredMemoryWorkers(session.apartmentId);
+        if (saved !== null) {
+          resolvedWorkers = saved;
+        } else {
+          setStoredMemoryWorkers(session.apartmentId, res.workers);
+        }
+      }
+
+      setWorkers(resolvedWorkers);
       setSelectedWorkerId((prev) => {
-        if (prev && res.workers.some((w) => w.id === prev)) {
+        if (prev && resolvedWorkers.some((w) => w.id === prev)) {
           return prev;
         }
         return '';
@@ -286,7 +325,7 @@ export default function App() {
     } catch {
       // Ignore transient errors
     }
-  }, [session?.authenticated]);
+  }, [session?.authenticated, session?.apartmentId]);
 
   const fetchLogs = useCallback(async () => {
     if (!session?.authenticated) return;
@@ -1213,8 +1252,10 @@ export default function App() {
           <AdminPanel
             isAdmin={session.isAdmin}
             isMaster={Boolean(session.isMaster)}
+            apartmentId={session.apartmentId}
             apartmentName={session.apartmentName}
             officeName={session.officeName}
+            storageMode={storageMode}
             workers={workers}
             logs={logs}
             banners={banners}
@@ -1243,6 +1284,7 @@ export default function App() {
               )
             }
             onWorkersChanged={() => void fetchWorkers()}
+            onWorkersReplaced={handleWorkersReplaced}
             onBannersChanged={setBanners}
             onAdStateChanged={applyAdState}
             onEditLog={setEditingLog}

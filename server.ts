@@ -85,6 +85,14 @@ const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const STORE_PATH = path.join(DATA_DIR, 'store.json');
 const DEFAULT_APARTMENT_ID = 'apt-horyeoul7';
 
+let storageWriteFailed = false;
+
+function getStorageMode(): 'postgres' | 'memory' | 'file' {
+  if (USE_POSTGRES) return 'postgres';
+  if (IS_VERCEL || storageWriteFailed) return 'memory';
+  return 'file';
+}
+
 interface ApartmentRecord {
   id: string;
   name: string;
@@ -837,7 +845,9 @@ function ensureStorage(): void {
       memoryStore = initial;
       fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), 'utf8');
     }
+    storageWriteFailed = false;
   } catch {
+    storageWriteFailed = true;
     if (!memoryStore) {
       memoryStore = createInitialStore();
     }
@@ -845,7 +855,7 @@ function ensureStorage(): void {
 }
 
 function readStore(): StoreData {
-  if (IS_VERCEL && memoryStore) {
+  if ((IS_VERCEL || storageWriteFailed) && memoryStore) {
     return memoryStore;
   }
   ensureStorage();
@@ -959,8 +969,10 @@ function writeStore(data: StoreData): void {
     const tmpPath = `${STORE_PATH}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
     fs.renameSync(tmpPath, STORE_PATH);
+    storageWriteFailed = false;
   } catch {
     // Keep memoryStore as fallback on read-only serverless filesystems
+    storageWriteFailed = true;
   }
 }
 
@@ -1523,7 +1535,7 @@ export function createApp(): Express {
       }
       res.json({
         ok: true,
-        storage: IS_VERCEL ? 'memory' : 'file',
+        storage: getStorageMode(),
         env,
         ...(PG_CONFIG_INVALID
           ? {
@@ -2280,12 +2292,16 @@ export function createApp(): Express {
           'SELECT * FROM workers WHERE apartment_id = $1 ORDER BY created_at ASC',
           [apartmentId]
         );
-        res.json({ workers: result.rows.map(mapWorkerRow) });
+        res.json({
+          workers: result.rows.map(mapWorkerRow),
+          storage: 'postgres',
+        });
         return;
       }
       const store = readStore();
       res.json({
         workers: store.workers.filter((w) => w.apartmentId === apartmentId),
+        storage: getStorageMode(),
       });
     })
   );
@@ -2295,7 +2311,10 @@ export function createApp(): Express {
     requireAuth,
     requireAdmin,
     asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const { name, role } = req.body as { name?: string; role?: string };
+      const { name, role } = (req.body || {}) as {
+        name?: string;
+        role?: string;
+      };
       const apartmentId = req.session!.apartmentId;
       const trimmedName = (name || '').trim();
       const trimmedRole = (role || '').trim() || '직원';
@@ -2341,7 +2360,15 @@ export function createApp(): Express {
             newWorker.createdAt,
           ]
         );
-        res.status(201).json({ worker: newWorker });
+        const allRes = await pool.query(
+          'SELECT * FROM workers WHERE apartment_id = $1 ORDER BY created_at ASC',
+          [apartmentId]
+        );
+        res.status(201).json({
+          worker: newWorker,
+          workers: allRes.rows.map(mapWorkerRow),
+          storage: 'postgres',
+        });
         return;
       }
 
@@ -2357,7 +2384,11 @@ export function createApp(): Express {
 
       store.workers.push(newWorker);
       writeStore(store);
-      res.status(201).json({ worker: newWorker });
+      res.status(201).json({
+        worker: newWorker,
+        workers: store.workers.filter((w) => w.apartmentId === apartmentId),
+        storage: getStorageMode(),
+      });
     })
   );
 
@@ -2366,12 +2397,13 @@ export function createApp(): Express {
     requireAuth,
     requireAdmin,
     asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const { id } = req.params;
+      const id = decodeURIComponent(String(req.params.id || '')).trim();
       const apartmentId = req.session!.apartmentId;
 
       if (USE_POSTGRES) {
         await ensurePgReady();
-        const result = await getPgPool().query(
+        const pool = getPgPool();
+        const result = await pool.query(
           'DELETE FROM workers WHERE id = $1 AND apartment_id = $2 RETURNING id',
           [id, apartmentId]
         );
@@ -2379,23 +2411,40 @@ export function createApp(): Express {
           res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
           return;
         }
-        res.json({ ok: true });
+        const allRes = await pool.query(
+          'SELECT * FROM workers WHERE apartment_id = $1 ORDER BY created_at ASC',
+          [apartmentId]
+        );
+        res.json({
+          ok: true,
+          deletedId: id,
+          workers: allRes.rows.map(mapWorkerRow),
+          storage: 'postgres',
+        });
         return;
       }
 
       const store = readStore();
+      const storageMode = getStorageMode();
       const exists = store.workers.some(
         (w) => w.id === id && w.apartmentId === apartmentId
       );
-      if (!exists) {
+      if (!exists && storageMode !== 'memory') {
         res.status(404).json({ error: '해당 직원을 찾을 수 없습니다.' });
         return;
       }
-      store.workers = store.workers.filter(
-        (w) => !(w.id === id && w.apartmentId === apartmentId)
-      );
-      writeStore(store);
-      res.json({ ok: true });
+      if (exists) {
+        store.workers = store.workers.filter(
+          (w) => !(w.id === id && w.apartmentId === apartmentId)
+        );
+        writeStore(store);
+      }
+      res.json({
+        ok: true,
+        deletedId: id,
+        workers: store.workers.filter((w) => w.apartmentId === apartmentId),
+        storage: storageMode,
+      });
     })
   );
 

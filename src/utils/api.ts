@@ -1,5 +1,10 @@
+import type { Worker } from '../types';
+
 const TOKEN_KEY = 'horyeoul7_session_token';
 const WORKER_KEY = 'horyeoul7_selected_worker_id';
+const MEMORY_WORKERS_PREFIX = 'horyeoul7_memory_workers_';
+
+export type StorageMode = 'postgres' | 'memory' | 'file';
 
 export function getStoredToken(): string | null {
   try {
@@ -36,6 +41,36 @@ export function setStoredWorkerId(workerId: string): void {
     } else {
       localStorage.removeItem(WORKER_KEY);
     }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function getStoredMemoryWorkers(apartmentId: string): Worker[] | null {
+  if (!apartmentId) return null;
+  try {
+    const raw = localStorage.getItem(`${MEMORY_WORKERS_PREFIX}${apartmentId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed as Worker[];
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return null;
+}
+
+export function setStoredMemoryWorkers(
+  apartmentId: string,
+  workers: Worker[]
+): void {
+  if (!apartmentId) return;
+  try {
+    localStorage.setItem(
+      `${MEMORY_WORKERS_PREFIX}${apartmentId}`,
+      JSON.stringify(workers)
+    );
   } catch {
     // Ignore storage errors
   }
