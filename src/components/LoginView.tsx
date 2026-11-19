@@ -43,8 +43,13 @@ export function LoginView({ defaultCompanyId, onLoginSuccess }: LoginViewProps) 
           setCompanyId(res.apartments[0].companyId);
         }
       })
-      .catch(() => {
-        // Fallback to manual login
+      .catch((err) => {
+        if (!active) return;
+        setError(
+          err instanceof Error
+            ? err.message
+            : '서버 연결 상태를 확인할 수 없습니다.'
+        );
       });
     return () => {
       active = false;

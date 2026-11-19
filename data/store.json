@@ -135,6 +135,14 @@
       "isMaster": true,
       "createdAt": "2026-11-19T10:57:16.873Z",
       "lastSeenAt": "2026-11-19T10:57:16.910Z"
+    },
+    "eyJpZCI6IjZlNjJlNzA2YWRjYzFjNzgiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjp0cnVlLCJtc3QiOmZhbHNlLCJpYXQiOjE3OTUwODYzMDgxNTJ9._DUkAq85ny8sylxAY9dtTO_iVqHE78YfIm-avd4f8vc": {
+      "token": "eyJpZCI6IjZlNjJlNzA2YWRjYzFjNzgiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjp0cnVlLCJtc3QiOmZhbHNlLCJpYXQiOjE3OTUwODYzMDgxNTJ9._DUkAq85ny8sylxAY9dtTO_iVqHE78YfIm-avd4f8vc",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": true,
+      "isMaster": false,
+      "createdAt": "2026-11-19T11:05:08.144Z",
+      "lastSeenAt": "2026-11-19T11:05:08.152Z"
     }
   },
   "notices": [

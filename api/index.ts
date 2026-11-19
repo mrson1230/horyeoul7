@@ -1,3 +1,3 @@
-import { app } from '../server';
+import { handleVercelApi } from '../server';
 
-export default app;
+export default handleVercelApi;

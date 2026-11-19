@@ -76,7 +76,7 @@ export async function apiFetch<T>(
   const contentType = res.headers.get('content-type') || '';
 
   if (!res.ok) {
-    let message = '요청 처리 중 오류가 발생했습니다.';
+    let message = `요청 처리 중 오류가 발생했습니다. (HTTP ${res.status})`;
     if (contentType.includes('application/json')) {
       try {
         const data = (await res.json()) as { error?: string };
@@ -90,6 +90,11 @@ export async function apiFetch<T>(
 
   if (contentType.includes('application/json')) {
     return (await res.json()) as T;
+  }
+  if (contentType.includes('text/html')) {
+    throw new Error(
+      'API 서버 응답을 받지 못했습니다. 배포 환경의 API 경로 설정을 확인해 주세요.'
+    );
   }
   return {} as T;
 }

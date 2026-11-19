@@ -1137,7 +1137,19 @@ function filterAndSortLogs(
 export function createApp(): express.Express {
   ensureStorage();
   const app = express();
-  app.use(express.json({ limit: '10mb' }));
+  const jsonParser = express.json({ limit: '10mb' });
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (
+      req.body &&
+      typeof req.body === 'object' &&
+      !Buffer.isBuffer(req.body) &&
+      req.headers['content-type']?.toLowerCase().includes('application/json')
+    ) {
+      next();
+      return;
+    }
+    jsonParser(req, res, next);
+  });
 
   app.get('/api/uploads/:filename', (req: Request, res: Response) => {
     const safeName = path.basename(req.params.filename);
@@ -3684,6 +3696,13 @@ export function createApp(): express.Express {
     })
   );
 
+  // Ensure unmatched /api/* routes always return JSON (never Express HTML 404)
+  app.use('/api', (req: Request, res: Response) => {
+    res.status(404).json({
+      error: `요청하신 API 경로를 찾을 수 없습니다. (${req.method} ${req.originalUrl || req.url})`,
+    });
+  });
+
   // Express JSON error boundary
   app.use(
     (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -3711,6 +3730,53 @@ export function createApp(): express.Express {
 }
 
 export const app = createApp();
+
+export function handleVercelApi(req: Request, res: Response): void {
+  try {
+    const rawUrl = req.url || '/';
+    const originalUrlHeader =
+      (req.headers['x-vercel-original-url'] as string | undefined) ||
+      (req.headers['x-forwarded-uri'] as string | undefined) ||
+      (req.headers['x-rewrite-url'] as string | undefined);
+
+    if (
+      originalUrlHeader &&
+      originalUrlHeader.startsWith('/api/') &&
+      !originalUrlHeader.startsWith('/api/index')
+    ) {
+      req.url = originalUrlHeader;
+    } else if (
+      rawUrl === '/api/index' ||
+      rawUrl.startsWith('/api/index?') ||
+      rawUrl.startsWith('/api/[...path]')
+    ) {
+      const qIdx = rawUrl.indexOf('?');
+      if (qIdx !== -1) {
+        const params = new URLSearchParams(rawUrl.slice(qIdx + 1));
+        const dynamicPath = params.get('...path') || params.get('path');
+        if (dynamicPath) {
+          params.delete('...path');
+          params.delete('path');
+          const rest = params.toString();
+          const normalizedSubpath = dynamicPath.replace(/^\/+/, '');
+          req.url = `/api/${normalizedSubpath}${rest ? `?${rest}` : ''}`;
+        }
+      }
+    } else if (!rawUrl.startsWith('/api')) {
+      req.url = `/api${rawUrl.startsWith('/') ? '' : '/'}${rawUrl}`;
+    }
+
+    app(req, res);
+  } catch (err) {
+    console.error('Vercel API invocation error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: '서버 API 초기화 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+      });
+    }
+  }
+}
+
 export default app;
 
 function isDirectServerExecution(): boolean {
