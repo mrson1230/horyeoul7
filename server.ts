@@ -3,14 +3,31 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import express from 'express';
-import type { NextFunction, Request, Response } from 'express';
-import pg from 'pg';
+import expressModule from 'express';
+import type { Express, NextFunction, Request, Response } from 'express';
+import pgModule from 'pg';
 
-const { Pool } = pg;
+const express = ((expressModule as unknown as { default?: typeof expressModule }).default ||
+  expressModule) as typeof expressModule;
+const pgResolved = pgModule as unknown as {
+  Pool?: typeof pgModule.Pool;
+  default?: { Pool?: typeof pgModule.Pool };
+};
+const Pool = pgResolved.Pool || pgResolved.default?.Pool || pgModule.Pool;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+let __filename = '';
+try {
+  if (
+    typeof import.meta !== 'undefined' &&
+    typeof import.meta.url === 'string' &&
+    import.meta.url.startsWith('file:')
+  ) {
+    __filename = fileURLToPath(import.meta.url);
+  }
+} catch {
+  __filename = '';
+}
+const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 
 const IS_VERCEL = Boolean(
   process.env.VERCEL || process.env.VERCEL_ENV || process.env.NOW_REGION
@@ -190,10 +207,10 @@ interface StoreData {
 }
 
 let memoryStore: StoreData | null = null;
-let pgPool: pg.Pool | null = null;
+let pgPool: pgModule.Pool | null = null;
 let pgInitPromise: Promise<void> | null = null;
 
-function getPgPool(): pg.Pool {
+function getPgPool(): pgModule.Pool {
   if (!pgPool) {
     const needsSsl =
       PG_CONNECTION_STRING.length > 0 &&
@@ -1212,7 +1229,7 @@ function filterAndSortLogs(
   });
 }
 
-export function createApp(): express.Express {
+export function createApp(): Express {
   ensureStorage();
   const envDiagnostics = getEnvDiagnostics();
   console.info('[Server Init] Runtime & auth environment:', {
@@ -3988,7 +4005,7 @@ export function handleVercelApi(req: Request, res: Response): void {
 export default app;
 
 function isDirectServerExecution(): boolean {
-  if (IS_VERCEL || typeof process.argv[1] !== 'string') {
+  if (IS_VERCEL || typeof process.argv[1] !== 'string' || !__filename) {
     return false;
   }
   try {
