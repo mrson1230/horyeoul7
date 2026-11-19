@@ -36,6 +36,34 @@
   ],
   "logs": [
     {
+      "id": "log-mwniaho0-8287",
+      "apartmentId": "apt-horyeoul7",
+      "workerId": "w-1",
+      "workerName": "김철수",
+      "workerRole": "시설과장",
+      "workDate": "2026-11-19",
+      "location": "702동 기계실 테스트",
+      "content": "배관 누수 긴급 점검 필요 (자동 테스트)",
+      "status": "completed",
+      "photoUrl": null,
+      "createdAt": "2026-11-19T12:08:09.456Z",
+      "updatedAt": "2026-11-19T12:08:09.725Z"
+    },
+    {
+      "id": "log-mwni7l4q-8787",
+      "apartmentId": "apt-horyeoul7",
+      "workerId": "w-1",
+      "workerName": "김철수",
+      "workerRole": "시설과장",
+      "workDate": "2026-11-19",
+      "location": "702동 기계실 테스트",
+      "content": "배관 누수 긴급 점검 필요 (자동 테스트)",
+      "status": "completed",
+      "photoUrl": null,
+      "createdAt": "2026-11-19T12:05:53.978Z",
+      "updatedAt": "2026-11-19T12:05:53.978Z"
+    },
+    {
       "id": "log-seed-1",
       "workerId": "w-1",
       "workerName": "김철수",
@@ -159,6 +187,38 @@
       "isMaster": false,
       "createdAt": "2026-11-19T11:22:11.256Z",
       "lastSeenAt": "2026-11-19T11:22:11.256Z"
+    },
+    "eyJpZCI6ImY0NjhmNWMwMGE2ZGEyNWUiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDg4NjcxMDc1fQ.CGsiRwu5Vfnvu4AXlMtacmMX6N_KrdpRicXvXRpek_Q": {
+      "token": "eyJpZCI6ImY0NjhmNWMwMGE2ZGEyNWUiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDg4NjcxMDc1fQ.CGsiRwu5Vfnvu4AXlMtacmMX6N_KrdpRicXvXRpek_Q",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": false,
+      "isMaster": false,
+      "createdAt": "2026-11-19T11:44:31.076Z",
+      "lastSeenAt": "2026-11-19T11:44:31.076Z"
+    },
+    "eyJpZCI6IjFmMDcyMWVmMTUzOTE5ZDAiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDg4Njg4MzM1fQ.BYChGDG1WnfB-i3s76LJ2zvAJ-x1V1kFHcAuZ5gLWow": {
+      "token": "eyJpZCI6IjFmMDcyMWVmMTUzOTE5ZDAiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDg4Njg4MzM1fQ.BYChGDG1WnfB-i3s76LJ2zvAJ-x1V1kFHcAuZ5gLWow",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": false,
+      "isMaster": false,
+      "createdAt": "2026-11-19T11:44:48.335Z",
+      "lastSeenAt": "2026-11-19T11:44:48.335Z"
+    },
+    "eyJpZCI6IjZlN2M3Y2MwMTkwZWNlNjQiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDg5OTUzOTUxfQ.pw6ZlaGZ-tc2dq4FK5oeM79VtsLfcf_d24vyREj8U8s": {
+      "token": "eyJpZCI6IjZlN2M3Y2MwMTkwZWNlNjQiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDg5OTUzOTUxfQ.pw6ZlaGZ-tc2dq4FK5oeM79VtsLfcf_d24vyREj8U8s",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": false,
+      "isMaster": false,
+      "createdAt": "2026-11-19T12:05:53.951Z",
+      "lastSeenAt": "2026-11-19T12:05:53.951Z"
+    },
+    "eyJpZCI6ImZlZDZhYzM2MmQ4ZWQxMWEiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDkwMDg5NDMwfQ.NCMpDd25KAEcv5Pj2FoZlSGmFyxNjNn45_fhsmaXO9g": {
+      "token": "eyJpZCI6ImZlZDZhYzM2MmQ4ZWQxMWEiLCJhcHQiOiJhcHQtaG9yeWVvdWw3IiwiYWRtIjpmYWxzZSwibXN0IjpmYWxzZSwiaWF0IjoxNzk1MDkwMDg5NDMwfQ.NCMpDd25KAEcv5Pj2FoZlSGmFyxNjNn45_fhsmaXO9g",
+      "apartmentId": "apt-horyeoul7",
+      "isAdmin": false,
+      "isMaster": false,
+      "createdAt": "2026-11-19T12:08:09.430Z",
+      "lastSeenAt": "2026-11-19T12:08:09.430Z"
     }
   },
   "notices": [
@@ -240,5 +300,35 @@
     "adsenseSlotId": "",
     "adfitUnitId": "",
     "updatedAt": "2026-11-19T10:57:16.930Z"
-  }
+  },
+  "chatMessages": [
+    {
+      "id": "chat-seed-1",
+      "apartmentId": "apt-horyeoul7",
+      "roomId": "general",
+      "workerId": "w-1",
+      "workerName": "김철수",
+      "workerRole": "시설과장",
+      "message": "오늘 오전 지하주차장 조명 교체 작업 완료했습니다. 오후 순찰 시 특이사항 있으면 여기 바로 공유 부탁드립니다!",
+      "imageUrl": null,
+      "replyToId": null,
+      "replyToSender": null,
+      "replyToText": null,
+      "createdAt": "2026-11-19T10:59:07.223Z"
+    },
+    {
+      "id": "chat-seed-2",
+      "apartmentId": "apt-horyeoul7",
+      "roomId": "general",
+      "workerId": "w-2",
+      "workerName": "이영희",
+      "workerRole": "관리주임",
+      "message": "네 확인했습니다 과장님! 저는 704동~705동 중앙 보행로 배수로 정비 중입니다.",
+      "imageUrl": null,
+      "replyToId": "chat-seed-1",
+      "replyToSender": "김철수",
+      "replyToText": "오늘 오전 지하주차장 조명 교체 작업 완료했습니다. 오후 순찰 시 특이사항 있으면 여기 바로 공유 부탁드립니다!",
+      "createdAt": "2026-11-19T11:19:07.223Z"
+    }
+  ]
 }

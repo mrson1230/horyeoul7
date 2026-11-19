@@ -281,6 +281,11 @@ export function WorkLogComposer({
               진행 상태
             </span>
             <WorkStatusSelector value={status} onChange={setStatus} />
+            {status === 'urgent' && (
+              <p className="mt-2 px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-xs font-medium text-rose-800 leading-relaxed">
+                🚨 <strong>긴급</strong> 상태로 등록하면 직원 채팅 <strong>긴급·시설 공유방</strong>에 자동 공유되고, 접속 중인 직원들에게 실시간 알림이 발송됩니다.
+              </p>
+            )}
           </div>
 
           <div>

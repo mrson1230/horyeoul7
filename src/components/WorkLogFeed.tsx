@@ -4,6 +4,7 @@ import {
   ChevronDown,
   ChevronUp,
   ClipboardList,
+  FileSpreadsheet,
   Image as ImageIcon,
   Maximize2,
   Pencil,
@@ -17,6 +18,7 @@ import {
   formatKoreanDateTime,
   getTodayKoreaDate,
 } from '../utils/api';
+import { exportWorkLogsToCsv } from '../utils/exportCsv';
 import {
   buildSlideshowItems,
   PhotoSlideshowModal,
@@ -27,6 +29,7 @@ import type { Worker, WorkLog, WorkStatus } from '../types';
 interface WorkLogFeedProps {
   logs: WorkLog[];
   workers: Worker[];
+  apartmentName?: string;
   selectedWorkerId: string;
   isAdmin: boolean;
   loading: boolean;
@@ -91,6 +94,7 @@ function LogPhotoThumbnail({
 export function WorkLogFeed({
   logs,
   workers,
+  apartmentName,
   selectedWorkerId,
   isAdmin,
   loading,
@@ -113,6 +117,7 @@ export function WorkLogFeed({
   const [updatingStatusId, setUpdatingStatusId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [slideshowIndex, setSlideshowIndex] = useState<number | null>(null);
+  const [exportDone, setExportDone] = useState(false);
 
   const slideshowItems = buildSlideshowItems(logs);
   const today = getTodayKoreaDate();
@@ -162,11 +167,28 @@ export function WorkLogFeed({
     }
   };
 
+  const handleExportExcel = () => {
+    if (logs.length === 0) return;
+    setActionError(null);
+    try {
+      exportWorkLogsToCsv(logs, {
+        apartmentName,
+        filterDate,
+      });
+      setExportDone(true);
+      setTimeout(() => setExportDone(false), 2500);
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : '엑셀 파일 내보내기에 실패했습니다.'
+      );
+    }
+  };
+
   return (
     <div className="space-y-4">
       {/* Compact Mobile-First Filter Bar */}
       <section className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-5">
-        <div className="flex items-center justify-between gap-2 mb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
           <div>
             <h2 className="text-base font-bold text-slate-900">전체 작업 내역</h2>
             <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
@@ -174,7 +196,7 @@ export function WorkLogFeed({
             </p>
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             {hasActiveFilter && (
               <button
                 type="button"
@@ -185,6 +207,20 @@ export function WorkLogFeed({
                 <span>초기화</span>
               </button>
             )}
+            <button
+              type="button"
+              disabled={loading || logs.length === 0}
+              onClick={handleExportExcel}
+              title={
+                logs.length === 0
+                  ? '내보낼 작업 내역이 없습니다.'
+                  : '현재 조회된 작업 내역을 엑셀 호환 CSV 파일로 다운로드합니다.'
+              }
+              className="min-h-[40px] px-3 py-1.5 text-xs font-semibold text-teal-800 bg-teal-50 hover:bg-teal-100 border border-teal-200/80 disabled:opacity-45 disabled:cursor-not-allowed rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>{exportDone ? '다운로드 완료' : '엑셀로 내보내기'}</span>
+            </button>
             <button
               type="button"
               onClick={() => setMobileFiltersOpen((prev) => !prev)}
@@ -395,7 +431,11 @@ export function WorkLogFeed({
             return (
               <article
                 key={log.id}
-                className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 transition-colors"
+                className={`rounded-2xl p-4 sm:p-5 transition-colors border ${
+                  log.status === 'urgent'
+                    ? 'bg-rose-50/40 border-rose-300 ring-1 ring-rose-200/70'
+                    : 'bg-white border-slate-200'
+                }`}
               >
                 {/* Clean Unboxed Metadata Line */}
                 <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs text-slate-500">

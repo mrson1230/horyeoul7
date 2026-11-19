@@ -126,4 +126,19 @@ CREATE TABLE IF NOT EXISTS global_ad_slot (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id TEXT PRIMARY KEY,
+  apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+  room_id TEXT NOT NULL DEFAULT 'general',
+  worker_id TEXT NOT NULL,
+  worker_name TEXT NOT NULL,
+  worker_role TEXT NOT NULL,
+  message TEXT NOT NULL DEFAULT '',
+  image_url TEXT,
+  reply_to_id TEXT,
+  reply_to_sender TEXT,
+  reply_to_text TEXT,
+  created_at TEXT NOT NULL
+);
 
+CREATE INDEX IF NOT EXISTS idx_chat_messages_apartment_room ON chat_messages (apartment_id, room_id, created_at ASC);

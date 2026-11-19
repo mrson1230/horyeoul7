@@ -1,11 +1,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import expressModule from 'express';
 import type { Express, NextFunction, Request, Response } from 'express';
 import pgModule from 'pg';
+import { WebSocketServer, WebSocket } from 'ws';
 
 const express = ((expressModule as unknown as { default?: typeof expressModule }).default ||
   expressModule) as typeof expressModule;
@@ -101,7 +103,7 @@ interface WorkerRecord {
   createdAt: string;
 }
 
-type WorkStatus = 'pending' | 'in_progress' | 'completed';
+type WorkStatus = 'urgent' | 'pending' | 'in_progress' | 'completed';
 
 interface WorkLogRecord {
   id: string;
@@ -193,6 +195,37 @@ interface LegacySettings {
   adminPassword?: string;
 }
 
+type ChatRoomId = 'general' | 'urgent';
+
+interface ChatMessageRecord {
+  id: string;
+  apartmentId: string;
+  roomId: ChatRoomId;
+  workerId: string;
+  workerName: string;
+  workerRole: string;
+  message: string;
+  imageUrl: string | null;
+  replyToId: string | null;
+  replyToSender: string | null;
+  replyToText: string | null;
+  createdAt: string;
+}
+
+interface ChatOnlineUser {
+  workerId: string;
+  workerName: string;
+  workerRole: string;
+}
+
+interface ChatSocketClient {
+  ws: WebSocket;
+  apartmentId: string;
+  workerId: string;
+  workerName: string;
+  workerRole: string;
+}
+
 interface StoreData {
   settings?: LegacySettings;
   apartments: ApartmentRecord[];
@@ -203,7 +236,85 @@ interface StoreData {
   banners?: EventBannerRecord[];
   externalAds?: Record<string, ExternalAdRecord>;
   globalAd?: ExternalAdRecord;
+  chatMessages?: ChatMessageRecord[];
   sessions: Record<string, SessionRecord>;
+}
+
+const chatSocketClients = new Set<ChatSocketClient>();
+const httpPresenceMap = new Map<
+  string,
+  Map<string, ChatOnlineUser & { expiresAt: number }>
+>();
+
+function getOnlineUsersForApartment(apartmentId: string): ChatOnlineUser[] {
+  const byWorker = new Map<string, ChatOnlineUser>();
+  for (const client of chatSocketClients) {
+    if (
+      client.apartmentId === apartmentId &&
+      client.ws.readyState === WebSocket.OPEN &&
+      client.workerId
+    ) {
+      byWorker.set(client.workerId, {
+        workerId: client.workerId,
+        workerName: client.workerName,
+        workerRole: client.workerRole,
+      });
+    }
+  }
+  const now = Date.now();
+  const httpMap = httpPresenceMap.get(apartmentId);
+  if (httpMap) {
+    for (const [wId, entry] of httpMap.entries()) {
+      if (entry.expiresAt < now) {
+        httpMap.delete(wId);
+      } else if (!byWorker.has(wId)) {
+        byWorker.set(wId, {
+          workerId: entry.workerId,
+          workerName: entry.workerName,
+          workerRole: entry.workerRole,
+        });
+      }
+    }
+  }
+  return Array.from(byWorker.values());
+}
+
+function recordHttpPresence(
+  apartmentId: string,
+  user: ChatOnlineUser
+): void {
+  if (!user.workerId) return;
+  let aptMap = httpPresenceMap.get(apartmentId);
+  if (!aptMap) {
+    aptMap = new Map();
+    httpPresenceMap.set(apartmentId, aptMap);
+  }
+  aptMap.set(user.workerId, {
+    ...user,
+    expiresAt: Date.now() + 45_000,
+  });
+}
+
+function broadcastChatEvent(
+  apartmentId: string,
+  payload: Record<string, unknown>,
+  excludeWs?: WebSocket
+): void {
+  if (chatSocketClients.size === 0) return;
+  const serialized = JSON.stringify(payload);
+  for (const client of chatSocketClients) {
+    if (
+      client.apartmentId === apartmentId &&
+      client.ws.readyState === WebSocket.OPEN &&
+      client.ws !== excludeWs
+    ) {
+      try {
+        client.ws.send(serialized);
+      } catch {
+        // Ignore closed socket write errors
+      }
+    }
+  }
 }
 
 let memoryStore: StoreData | null = null;
@@ -297,6 +408,44 @@ function createSeedHandovers(): HandoverRecord[] {
       completedAt: earlierIso,
       createdAt: earlierIso,
       updatedAt: earlierIso,
+    },
+  ];
+}
+
+function createSeedChatMessages(): ChatMessageRecord[] {
+  const earlier = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  const recent = new Date(Date.now() - 25 * 60 * 1000).toISOString();
+  return [
+    {
+      id: 'chat-seed-1',
+      apartmentId: DEFAULT_APARTMENT_ID,
+      roomId: 'general',
+      workerId: 'w-1',
+      workerName: '김철수',
+      workerRole: '시설과장',
+      message:
+        '오늘 오전 지하주차장 조명 교체 작업 완료했습니다. 오후 순찰 시 특이사항 있으면 여기 바로 공유 부탁드립니다!',
+      imageUrl: null,
+      replyToId: null,
+      replyToSender: null,
+      replyToText: null,
+      createdAt: earlier,
+    },
+    {
+      id: 'chat-seed-2',
+      apartmentId: DEFAULT_APARTMENT_ID,
+      roomId: 'general',
+      workerId: 'w-2',
+      workerName: '이영희',
+      workerRole: '관리주임',
+      message:
+        '네 확인했습니다 과장님! 저는 704동~705동 중앙 보행로 배수로 정비 중입니다.',
+      imageUrl: null,
+      replyToId: 'chat-seed-1',
+      replyToSender: '김철수',
+      replyToText:
+        '오늘 오전 지하주차장 조명 교체 작업 완료했습니다. 오후 순찰 시 특이사항 있으면 여기 바로 공유 부탁드립니다!',
+      createdAt: recent,
     },
   ];
 }
@@ -402,6 +551,7 @@ function createInitialStore(): StoreData {
     banners: [],
     externalAds: {},
     globalAd: createDefaultExternalAd('__global__'),
+    chatMessages: createSeedChatMessages(),
     sessions: {},
   };
 }
@@ -533,6 +683,22 @@ async function ensurePgReady(): Promise<void> {
         adfit_unit_id TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        apartment_id TEXT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+        room_id TEXT NOT NULL DEFAULT 'general',
+        worker_id TEXT NOT NULL,
+        worker_name TEXT NOT NULL,
+        worker_role TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT '',
+        image_url TEXT,
+        reply_to_id TEXT,
+        reply_to_sender TEXT,
+        reply_to_text TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_apartment_room ON chat_messages (apartment_id, room_id, created_at ASC);
     `);
 
     const countRes = await pool.query<{ cnt: number }>(
@@ -618,6 +784,26 @@ async function ensurePgReady(): Promise<void> {
               h.completedAt,
               h.createdAt,
               h.updatedAt,
+            ]
+          );
+        }
+        for (const c of seed.chatMessages || []) {
+          await client.query(
+            `INSERT INTO chat_messages (id, apartment_id, room_id, worker_id, worker_name, worker_role, message, image_url, reply_to_id, reply_to_sender, reply_to_text, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO NOTHING`,
+            [
+              c.id,
+              c.apartmentId,
+              c.roomId,
+              c.workerId,
+              c.workerName,
+              c.workerRole,
+              c.message,
+              c.imageUrl,
+              c.replyToId,
+              c.replyToSender,
+              c.replyToText,
+              c.createdAt,
             ]
           );
         }
@@ -710,6 +896,10 @@ function readStore(): StoreData {
     }
     if (!parsed.globalAd || typeof parsed.globalAd !== 'object') {
       parsed.globalAd = createDefaultExternalAd('__global__');
+      mutated = true;
+    }
+    if (!Array.isArray(parsed.chatMessages)) {
+      parsed.chatMessages = createSeedChatMessages();
       mutated = true;
     }
 
@@ -809,7 +999,9 @@ function mapWorkerRow(r: Record<string, unknown>): WorkerRecord {
 function mapLogRow(r: Record<string, unknown>): WorkLogRecord {
   const rawStatus = String(r.status || 'completed');
   const status: WorkStatus =
-    rawStatus === 'pending' || rawStatus === 'in_progress'
+    rawStatus === 'urgent' ||
+    rawStatus === 'pending' ||
+    rawStatus === 'in_progress'
       ? rawStatus
       : 'completed';
   return {
@@ -927,6 +1119,24 @@ function mapExternalAdRow(r: Record<string, unknown>): ExternalAdRecord {
     adsenseSlotId: String(r.adsense_slot_id || ''),
     adfitUnitId: String(r.adfit_unit_id || ''),
     updatedAt: String(r.updated_at || new Date().toISOString()),
+  };
+}
+
+function mapChatMessageRow(r: Record<string, unknown>): ChatMessageRecord {
+  const roomId: ChatRoomId = r.room_id === 'urgent' ? 'urgent' : 'general';
+  return {
+    id: String(r.id),
+    apartmentId: String(r.apartment_id),
+    roomId,
+    workerId: String(r.worker_id),
+    workerName: String(r.worker_name),
+    workerRole: String(r.worker_role || '직원'),
+    message: String(r.message || ''),
+    imageUrl: r.image_url ? String(r.image_url) : null,
+    replyToId: r.reply_to_id ? String(r.reply_to_id) : null,
+    replyToSender: r.reply_to_sender ? String(r.reply_to_sender) : null,
+    replyToText: r.reply_to_text ? String(r.reply_to_text) : null,
+    createdAt: String(r.created_at),
   };
 }
 
@@ -2189,6 +2399,69 @@ export function createApp(): Express {
     })
   );
 
+  async function triggerUrgentWorkAlert(
+    apartmentId: string,
+    log: WorkLogRecord,
+    isUpgrade = false
+  ): Promise<ChatMessageRecord> {
+    const label = isUpgrade ? '긴급 작업 전환' : '긴급 작업 등록';
+    const chatRecord: ChatMessageRecord = {
+      id: `chat-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`,
+      apartmentId,
+      roomId: 'urgent',
+      workerId: log.workerId,
+      workerName: log.workerName,
+      workerRole: log.workerRole,
+      message: `[${label}] ${log.location}\n${log.content}`,
+      imageUrl: log.photoUrl,
+      replyToId: log.id,
+      replyToSender: '🚨 긴급 작업일지 연동',
+      replyToText: `${log.workDate} · ${log.location}`,
+      createdAt: new Date().toISOString(),
+    };
+
+    if (USE_POSTGRES) {
+      await getPgPool().query(
+        `INSERT INTO chat_messages (id, apartment_id, room_id, worker_id, worker_name, worker_role, message, image_url, reply_to_id, reply_to_sender, reply_to_text, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [
+          chatRecord.id,
+          chatRecord.apartmentId,
+          chatRecord.roomId,
+          chatRecord.workerId,
+          chatRecord.workerName,
+          chatRecord.workerRole,
+          chatRecord.message,
+          chatRecord.imageUrl,
+          chatRecord.replyToId,
+          chatRecord.replyToSender,
+          chatRecord.replyToText,
+          chatRecord.createdAt,
+        ]
+      );
+    } else {
+      const store = readStore();
+      if (!Array.isArray(store.chatMessages)) store.chatMessages = [];
+      store.chatMessages.push(chatRecord);
+      if (store.chatMessages.length > 600) {
+        store.chatMessages = store.chatMessages.slice(-500);
+      }
+      writeStore(store);
+    }
+
+    broadcastChatEvent(apartmentId, {
+      type: 'chat:message',
+      message: chatRecord,
+    });
+    broadcastChatEvent(apartmentId, {
+      type: 'worklog:urgent',
+      log,
+      chatMessage: chatRecord,
+    });
+
+    return chatRecord;
+  }
+
   // Work Logs
   app.get(
     '/api/logs',
@@ -2264,6 +2537,7 @@ export function createApp(): Express {
       const cleanLocation = (location || '').trim();
       const cleanContent = (content || '').trim();
       const cleanStatus: WorkStatus =
+        status === 'urgent' ||
         status === 'pending' ||
         status === 'in_progress' ||
         status === 'completed'
@@ -2339,7 +2613,16 @@ export function createApp(): Express {
         writeStore(store);
       }
 
-      res.status(201).json({ log: newLog });
+      let urgentChatMessage: ChatMessageRecord | null = null;
+      if (newLog.status === 'urgent') {
+        urgentChatMessage = await triggerUrgentWorkAlert(
+          apartmentId,
+          newLog,
+          false
+        );
+      }
+
+      res.status(201).json({ log: newLog, urgentChatMessage });
     })
   );
 
@@ -2404,6 +2687,7 @@ export function createApp(): Express {
       const cleanLocation = (location ?? existing.location).trim();
       const cleanContent = (content ?? existing.content).trim();
       const cleanStatus: WorkStatus =
+        status === 'urgent' ||
         status === 'pending' ||
         status === 'in_progress' ||
         status === 'completed'
@@ -2480,7 +2764,21 @@ export function createApp(): Express {
         }
       }
 
-      res.json({ log: updated });
+      let urgentChatMessage: ChatMessageRecord | null = null;
+      if (existing.status !== 'urgent' && updated.status === 'urgent') {
+        urgentChatMessage = await triggerUrgentWorkAlert(
+          apartmentId,
+          updated,
+          true
+        );
+      } else if (existing.status === 'urgent' || updated.status === 'urgent') {
+        broadcastChatEvent(apartmentId, {
+          type: 'worklog:updated',
+          log: updated,
+        });
+      }
+
+      res.json({ log: updated, urgentChatMessage });
     })
   );
 
@@ -2505,6 +2803,10 @@ export function createApp(): Express {
         deleteUploadedPhotoIfLocal(
           delRes.rows[0].photo_url ? String(delRes.rows[0].photo_url) : null
         );
+        broadcastChatEvent(apartmentId, {
+          type: 'worklog:deleted',
+          id,
+        });
         res.json({ ok: true });
         return;
       }
@@ -2522,6 +2824,10 @@ export function createApp(): Express {
         (l) => !(l.id === id && l.apartmentId === apartmentId)
       );
       writeStore(store);
+      broadcastChatEvent(apartmentId, {
+        type: 'worklog:deleted',
+        id,
+      });
       res.json({ ok: true });
     })
   );
@@ -3815,6 +4121,280 @@ export function createApp(): Express {
     })
   );
 
+  // Staff Chat (KakaoTalk-style room messaging + real-time WebSocket broadcast)
+  app.get(
+    '/api/chat/messages',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      const roomParam = req.query.roomId === 'urgent' ? 'urgent' : 'general';
+      const after = typeof req.query.after === 'string' ? req.query.after : '';
+
+      let messages: ChatMessageRecord[] = [];
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const result = after
+          ? await getPgPool().query(
+              `SELECT * FROM chat_messages
+               WHERE apartment_id = $1 AND room_id = $2 AND created_at > $3
+               ORDER BY created_at ASC LIMIT 200`,
+              [apartmentId, roomParam, after]
+            )
+          : await getPgPool().query(
+              `SELECT * FROM (
+                 SELECT * FROM chat_messages
+                 WHERE apartment_id = $1 AND room_id = $2
+                 ORDER BY created_at DESC LIMIT 200
+               ) sub ORDER BY created_at ASC`,
+              [apartmentId, roomParam]
+            );
+        messages = result.rows.map(mapChatMessageRow);
+      } else {
+        const store = readStore();
+        const filtered = (store.chatMessages || [])
+          .filter((m) => m.apartmentId === apartmentId && m.roomId === roomParam)
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        messages = after
+          ? filtered.filter((m) => m.createdAt > after)
+          : filtered.slice(-200);
+      }
+
+      res.json({
+        messages,
+        onlineUsers: getOnlineUsersForApartment(apartmentId),
+        wsSupported: !IS_VERCEL,
+      });
+    })
+  );
+
+  app.post(
+    '/api/chat/presence',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      const { workerId } = (req.body || {}) as { workerId?: string };
+
+      if (workerId) {
+        let worker: WorkerRecord | undefined;
+        if (USE_POSTGRES) {
+          await ensurePgReady();
+          const wRes = await getPgPool().query(
+            'SELECT * FROM workers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+            [workerId, apartmentId]
+          );
+          worker = wRes.rows[0] ? mapWorkerRow(wRes.rows[0]) : undefined;
+        } else {
+          const store = readStore();
+          worker = store.workers.find(
+            (w) => w.id === workerId && w.apartmentId === apartmentId
+          );
+        }
+        if (worker) {
+          recordHttpPresence(apartmentId, {
+            workerId: worker.id,
+            workerName: worker.name,
+            workerRole: worker.role,
+          });
+        }
+      }
+
+      res.json({ onlineUsers: getOnlineUsersForApartment(apartmentId) });
+    })
+  );
+
+  app.post(
+    '/api/chat/messages',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const apartmentId = req.session!.apartmentId;
+      const {
+        roomId,
+        workerId,
+        message,
+        imageBase64,
+        replyToId,
+        replyToSender,
+        replyToText,
+      } = (req.body || {}) as {
+        roomId?: string;
+        workerId?: string;
+        message?: string;
+        imageBase64?: string | null;
+        replyToId?: string | null;
+        replyToSender?: string | null;
+        replyToText?: string | null;
+      };
+
+      const targetRoom: ChatRoomId = roomId === 'urgent' ? 'urgent' : 'general';
+      let worker: WorkerRecord | undefined;
+
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const wRes = await getPgPool().query(
+          'SELECT * FROM workers WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [workerId || '', apartmentId]
+        );
+        worker = wRes.rows[0] ? mapWorkerRow(wRes.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        worker = store.workers.find(
+          (w) => w.id === workerId && w.apartmentId === apartmentId
+        );
+      }
+
+      if (!worker) {
+        res.status(400).json({
+          error: '채팅을 보내려면 상단에서 본인 이름(직원)을 먼저 선택해 주세요.',
+        });
+        return;
+      }
+
+      const cleanMessage = (message || '').trim().slice(0, 1500);
+      let imageUrl: string | null = null;
+      if (imageBase64 && typeof imageBase64 === 'string') {
+        try {
+          imageUrl = saveBase64Photo(imageBase64);
+        } catch (err) {
+          res.status(400).json({
+            error:
+              err instanceof Error
+                ? err.message
+                : '사진 전송에 실패했습니다.',
+          });
+          return;
+        }
+      }
+
+      if (!cleanMessage && !imageUrl) {
+        res.status(400).json({ error: '전송할 메시지나 사진을 입력해 주세요.' });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const record: ChatMessageRecord = {
+        id: `chat-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`,
+        apartmentId,
+        roomId: targetRoom,
+        workerId: worker.id,
+        workerName: worker.name,
+        workerRole: worker.role,
+        message: cleanMessage,
+        imageUrl,
+        replyToId: replyToId ? String(replyToId).slice(0, 80) : null,
+        replyToSender: replyToSender ? String(replyToSender).slice(0, 40) : null,
+        replyToText: replyToText ? String(replyToText).slice(0, 120) : null,
+        createdAt: nowIso,
+      };
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          `INSERT INTO chat_messages (id, apartment_id, room_id, worker_id, worker_name, worker_role, message, image_url, reply_to_id, reply_to_sender, reply_to_text, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          [
+            record.id,
+            record.apartmentId,
+            record.roomId,
+            record.workerId,
+            record.workerName,
+            record.workerRole,
+            record.message,
+            record.imageUrl,
+            record.replyToId,
+            record.replyToSender,
+            record.replyToText,
+            record.createdAt,
+          ]
+        );
+      } else {
+        const store = readStore();
+        if (!Array.isArray(store.chatMessages)) store.chatMessages = [];
+        store.chatMessages.push(record);
+        if (store.chatMessages.length > 600) {
+          store.chatMessages = store.chatMessages.slice(-500);
+        }
+        writeStore(store);
+      }
+
+      recordHttpPresence(apartmentId, {
+        workerId: worker.id,
+        workerName: worker.name,
+        workerRole: worker.role,
+      });
+
+      broadcastChatEvent(apartmentId, {
+        type: 'chat:message',
+        message: record,
+      });
+
+      res.status(201).json({ message: record });
+    })
+  );
+
+  app.delete(
+    '/api/chat/messages/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { id } = req.params;
+      const apartmentId = req.session!.apartmentId;
+      const actingWorkerId =
+        typeof req.query.actingWorkerId === 'string'
+          ? req.query.actingWorkerId
+          : (req.body as { actingWorkerId?: string } | undefined)
+              ?.actingWorkerId || '';
+
+      let target: ChatMessageRecord | undefined;
+      if (USE_POSTGRES) {
+        await ensurePgReady();
+        const found = await getPgPool().query(
+          'SELECT * FROM chat_messages WHERE id = $1 AND apartment_id = $2 LIMIT 1',
+          [id, apartmentId]
+        );
+        target = found.rows[0] ? mapChatMessageRow(found.rows[0]) : undefined;
+      } else {
+        const store = readStore();
+        target = (store.chatMessages || []).find(
+          (m) => m.id === id && m.apartmentId === apartmentId
+        );
+      }
+
+      if (!target) {
+        res.status(404).json({ error: '해당 메시지를 찾을 수 없습니다.' });
+        return;
+      }
+
+      const isAdmin = Boolean(req.session?.isAdmin);
+      const isOwner = Boolean(actingWorkerId && target.workerId === actingWorkerId);
+      if (!isAdmin && !isOwner) {
+        res.status(403).json({
+          error: '본인이 보낸 메시지만 삭제할 수 있습니다.',
+        });
+        return;
+      }
+
+      if (USE_POSTGRES) {
+        await getPgPool().query(
+          'DELETE FROM chat_messages WHERE id = $1 AND apartment_id = $2',
+          [id, apartmentId]
+        );
+      } else {
+        const store = readStore();
+        store.chatMessages = (store.chatMessages || []).filter(
+          (m) => !(m.id === id && m.apartmentId === apartmentId)
+        );
+        writeStore(store);
+      }
+
+      deleteUploadedPhotoIfLocal(target.imageUrl);
+      broadcastChatEvent(apartmentId, {
+        type: 'chat:deleted',
+        id: target.id,
+        roomId: target.roomId,
+      });
+
+      res.json({ ok: true });
+    })
+  );
+
   // CSV / Excel Unified Download
   app.get(
     '/api/logs/export.csv',
@@ -3856,7 +4436,13 @@ export function createApp(): Express {
       }
 
       const statusText = (s?: WorkStatus) =>
-        s === 'pending' ? '대기' : s === 'in_progress' ? '진행 중' : '완료';
+        s === 'urgent'
+          ? '긴급'
+          : s === 'pending'
+            ? '대기'
+            : s === 'in_progress'
+              ? '진행 중'
+              : '완료';
 
       const headers = [
         '번호',
@@ -4036,8 +4622,90 @@ async function startStandaloneServer() {
     });
   }
 
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req, socket, head) => {
+    void (async () => {
+      try {
+        const reqUrl = new URL(req.url || '/', 'http://localhost');
+        if (reqUrl.pathname !== '/ws/chat') {
+          return;
+        }
+
+        const token = reqUrl.searchParams.get('token') || '';
+        const session = token ? await findSessionByToken(token) : null;
+        if (!session) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          const client: ChatSocketClient = {
+            ws,
+            apartmentId: session.apartmentId,
+            workerId: reqUrl.searchParams.get('workerId') || '',
+            workerName: reqUrl.searchParams.get('workerName') || '',
+            workerRole: reqUrl.searchParams.get('workerRole') || '',
+          };
+          chatSocketClients.add(client);
+
+          broadcastChatEvent(client.apartmentId, {
+            type: 'chat:presence',
+            onlineUsers: getOnlineUsersForApartment(client.apartmentId),
+          });
+
+          ws.on('message', (raw) => {
+            try {
+              const data = JSON.parse(String(raw)) as {
+                type?: string;
+                workerId?: string;
+                workerName?: string;
+                workerRole?: string;
+                roomId?: string;
+              };
+              if (data.type === 'chat:presence:update') {
+                client.workerId = String(data.workerId || '');
+                client.workerName = String(data.workerName || '');
+                client.workerRole = String(data.workerRole || '');
+                broadcastChatEvent(client.apartmentId, {
+                  type: 'chat:presence',
+                  onlineUsers: getOnlineUsersForApartment(client.apartmentId),
+                });
+              } else if (data.type === 'chat:typing' && client.workerName) {
+                broadcastChatEvent(
+                  client.apartmentId,
+                  {
+                    type: 'chat:typing',
+                    roomId: data.roomId === 'urgent' ? 'urgent' : 'general',
+                    workerId: client.workerId,
+                    workerName: client.workerName,
+                  },
+                  ws
+                );
+              }
+            } catch {
+              // Ignore invalid WS messages
+            }
+          });
+
+          ws.on('close', () => {
+            chatSocketClients.delete(client);
+            broadcastChatEvent(client.apartmentId, {
+              type: 'chat:presence',
+              onlineUsers: getOnlineUsersForApartment(client.apartmentId),
+            });
+          });
+        });
+      } catch {
+        socket.destroy();
+      }
+    })();
+  });
+
   const port = Number(process.env.PORT) || 3000;
-  app.listen(port, '0.0.0.0', () => {
+  server.listen(port, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${port}`);
   });
 }

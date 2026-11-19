@@ -14,7 +14,7 @@ export interface Worker {
   createdAt: string;
 }
 
-export type WorkStatus = 'pending' | 'in_progress' | 'completed';
+export type WorkStatus = 'urgent' | 'pending' | 'in_progress' | 'completed';
 
 export interface WorkLog {
   id: string;
@@ -106,3 +106,47 @@ export interface SessionInfo {
   apartmentName: string;
   officeName: string;
 }
+
+export type ChatRoomId = 'general' | 'urgent';
+
+export interface ChatMessage {
+  id: string;
+  apartmentId: string;
+  roomId: ChatRoomId;
+  workerId: string;
+  workerName: string;
+  workerRole: string;
+  message: string;
+  imageUrl: string | null;
+  replyToId: string | null;
+  replyToSender: string | null;
+  replyToText: string | null;
+  createdAt: string;
+}
+
+export interface ChatOnlineUser {
+  workerId: string;
+  workerName: string;
+  workerRole: string;
+}
+
+export interface ChatRealtimePacket {
+  type?:
+    | 'chat:message'
+    | 'chat:deleted'
+    | 'chat:presence'
+    | 'chat:typing'
+    | 'worklog:urgent'
+    | 'worklog:updated'
+    | 'worklog:deleted'
+    | string;
+  message?: ChatMessage;
+  chatMessage?: ChatMessage;
+  log?: WorkLog;
+  id?: string;
+  roomId?: ChatRoomId;
+  onlineUsers?: ChatOnlineUser[];
+  workerId?: string;
+  workerName?: string;
+}
+

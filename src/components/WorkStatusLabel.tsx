@@ -1,4 +1,4 @@
-import { CheckCircle2, Clock, Wrench } from 'lucide-react';
+import { CheckCircle2, Clock, Siren, Wrench } from 'lucide-react';
 import type { WorkStatus } from '../types';
 
 export const WORK_STATUS_OPTIONS: Array<{
@@ -7,6 +7,12 @@ export const WORK_STATUS_OPTIONS: Array<{
   textClass: string;
   activeButtonClass: string;
 }> = [
+  {
+    value: 'urgent',
+    label: '긴급',
+    textClass: 'text-rose-700',
+    activeButtonClass: 'bg-rose-600 text-white border-rose-600',
+  },
   {
     value: 'pending',
     label: '대기',
@@ -34,6 +40,15 @@ export function getWorkStatusLabel(status: WorkStatus): string {
 
 export function WorkStatusLabel({ status }: { status?: WorkStatus }) {
   const safeStatus: WorkStatus = status || 'completed';
+
+  if (safeStatus === 'urgent') {
+    return (
+      <span className="inline-flex items-center gap-1 font-bold text-rose-700 whitespace-nowrap">
+        <Siren className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+        <span>긴급</span>
+      </span>
+    );
+  }
 
   if (safeStatus === 'pending') {
     return (
@@ -69,15 +84,21 @@ export function WorkStatusSelector({
   onChange: (next: WorkStatus) => void;
 }) {
   return (
-    <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="작업 진행 상태">
+    <div
+      className="grid grid-cols-2 sm:grid-cols-4 gap-2"
+      role="radiogroup"
+      aria-label="작업 진행 상태"
+    >
       {WORK_STATUS_OPTIONS.map((option) => {
         const active = value === option.value;
         const Icon =
-          option.value === 'pending'
-            ? Clock
-            : option.value === 'in_progress'
-              ? Wrench
-              : CheckCircle2;
+          option.value === 'urgent'
+            ? Siren
+            : option.value === 'pending'
+              ? Clock
+              : option.value === 'in_progress'
+                ? Wrench
+                : CheckCircle2;
 
         return (
           <button

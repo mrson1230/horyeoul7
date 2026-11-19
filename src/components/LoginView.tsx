@@ -6,6 +6,8 @@ import type { Apartment, SessionInfo } from '../types';
 
 const HERO_APARTMENT_IMAGE =
   '/src/assets/images/apartment_complex_hero_1794999359810.jpg';
+const APARTMENT_LOGO_IMAGE =
+  '/src/assets/images/horyeoul_apartment_logo_1795090158112.jpg';
 
 interface LoginViewProps {
   defaultCompanyId: string;
@@ -17,6 +19,7 @@ export function LoginView({ defaultCompanyId, onLoginSuccess }: LoginViewProps) 
   const [apartments, setApartments] = useState<Apartment[]>([]);
   const [selectedApartmentId, setSelectedApartmentId] = useState<string>('');
   const [heroImgFailed, setHeroImgFailed] = useState(false);
+  const [logoImgFailed, setLogoImgFailed] = useState(false);
 
   // Login form state
   const [companyId, setCompanyId] = useState(defaultCompanyId || 'horyeoul7');
@@ -161,15 +164,31 @@ export function LoginView({ defaultCompanyId, onLoginSuccess }: LoginViewProps) 
 
       <div className="relative z-10 w-full max-w-md mx-auto">
         <div className="mb-6 text-center sm:text-left">
-          <div className="inline-flex items-center gap-2 text-teal-300 mb-2.5">
-            <Building2 className="w-5 h-5 shrink-0" aria-hidden="true" />
-            <span className="text-sm font-semibold tracking-tight">
-              {activeApt?.officeName || '관리사무소 공동 관리 시스템'}
-            </span>
+          <div className="flex flex-col sm:flex-row items-center sm:items-start gap-3.5 mb-2.5">
+            {!logoImgFailed ? (
+              <img
+                src={APARTMENT_LOGO_IMAGE}
+                alt={`${activeApt?.name || '호려울마을 7단지'} 로고`}
+                referrerPolicy="no-referrer"
+                onError={() => setLogoImgFailed(true)}
+                className="w-14 h-14 rounded-2xl object-cover shadow-lg ring-2 ring-teal-300/40 shrink-0"
+              />
+            ) : (
+              <div className="w-14 h-14 rounded-2xl bg-teal-900/90 border border-teal-400/40 flex items-center justify-center shadow-lg shrink-0">
+                <Building2 className="w-7 h-7 text-teal-200" aria-hidden="true" />
+              </div>
+            )}
+            <div className="min-w-0">
+              <div className="inline-flex items-center gap-1.5 text-teal-300 mb-1">
+                <span className="text-xs sm:text-sm font-semibold tracking-tight">
+                  {activeApt?.officeName || '관리사무소 공동 관리 시스템'}
+                </span>
+              </div>
+              <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white text-balance">
+                {activeApt?.name || '아파트'} 공동 작업일지
+              </h1>
+            </div>
           </div>
-          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white text-balance">
-            {activeApt?.name || '아파트'} 공동 작업일지
-          </h1>
           <p className="mt-2 text-sm text-slate-200 leading-relaxed">
             단지 선택 후 회사 공통 아이디와 비밀번호로 로그인하거나, 새로운 아파트 단지를 등록해 바로 시작하세요.
           </p>

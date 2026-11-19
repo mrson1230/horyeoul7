@@ -121,6 +121,7 @@ export function WorkCalendarView({
 
   const monthSummary = useMemo(() => {
     let total = 0;
+    let urgent = 0;
     let completed = 0;
     let inProgress = 0;
     let pending = 0;
@@ -129,12 +130,13 @@ export function WorkCalendarView({
       if (!log.workDate.startsWith(monthPrefix)) continue;
       total += 1;
       const st: WorkStatus = log.status || 'completed';
-      if (st === 'pending') pending += 1;
+      if (st === 'urgent') urgent += 1;
+      else if (st === 'pending') pending += 1;
       else if (st === 'in_progress') inProgress += 1;
       else completed += 1;
     }
 
-    return { total, completed, inProgress, pending };
+    return { total, urgent, completed, inProgress, pending };
   }, [allLogs, monthPrefix]);
 
   const calendarCells = useMemo(() => {
@@ -161,16 +163,18 @@ export function WorkCalendarView({
   const slideshowItems = buildSlideshowItems(selectedDayLogs);
 
   const selectedDaySummary = useMemo(() => {
+    let urgent = 0;
     let completed = 0;
     let inProgress = 0;
     let pending = 0;
     for (const log of selectedDayLogs) {
       const st: WorkStatus = log.status || 'completed';
-      if (st === 'pending') pending += 1;
+      if (st === 'urgent') urgent += 1;
+      else if (st === 'pending') pending += 1;
       else if (st === 'in_progress') inProgress += 1;
       else completed += 1;
     }
-    return { completed, inProgress, pending };
+    return { urgent, completed, inProgress, pending };
   }, [selectedDayLogs]);
 
   const moveMonth = (delta: number) => {
@@ -311,28 +315,34 @@ export function WorkCalendarView({
           </div>
 
           {/* Monthly KPI Summary Strip */}
-          <div className="grid grid-cols-4 gap-px bg-slate-100 border-b border-slate-100">
-            <div className="bg-white px-3 py-3 sm:px-4">
-              <p className="text-[11px] font-medium text-slate-500">이달 전체</p>
-              <p className="mt-0.5 text-base sm:text-lg font-bold text-slate-900 tabular-nums">
+          <div className="grid grid-cols-5 gap-px bg-slate-100 border-b border-slate-100">
+            <div className="bg-white px-2.5 py-3 sm:px-4">
+              <p className="text-[11px] font-medium text-slate-500">전체</p>
+              <p className="mt-0.5 text-sm sm:text-lg font-bold text-slate-900 tabular-nums">
                 {monthSummary.total}건
               </p>
             </div>
-            <div className="bg-white px-3 py-3 sm:px-4">
+            <div className="bg-white px-2.5 py-3 sm:px-4">
+              <p className="text-[11px] font-medium text-rose-700">긴급</p>
+              <p className="mt-0.5 text-sm sm:text-lg font-bold text-rose-700 tabular-nums">
+                {monthSummary.urgent}건
+              </p>
+            </div>
+            <div className="bg-white px-2.5 py-3 sm:px-4">
               <p className="text-[11px] font-medium text-emerald-700">완료</p>
-              <p className="mt-0.5 text-base sm:text-lg font-bold text-emerald-700 tabular-nums">
+              <p className="mt-0.5 text-sm sm:text-lg font-bold text-emerald-700 tabular-nums">
                 {monthSummary.completed}건
               </p>
             </div>
-            <div className="bg-white px-3 py-3 sm:px-4">
+            <div className="bg-white px-2.5 py-3 sm:px-4">
               <p className="text-[11px] font-medium text-blue-700">진행 중</p>
-              <p className="mt-0.5 text-base sm:text-lg font-bold text-blue-700 tabular-nums">
+              <p className="mt-0.5 text-sm sm:text-lg font-bold text-blue-700 tabular-nums">
                 {monthSummary.inProgress}건
               </p>
             </div>
-            <div className="bg-white px-3 py-3 sm:px-4">
+            <div className="bg-white px-2.5 py-3 sm:px-4">
               <p className="text-[11px] font-medium text-amber-700">대기</p>
-              <p className="mt-0.5 text-base sm:text-lg font-bold text-amber-700 tabular-nums">
+              <p className="mt-0.5 text-sm sm:text-lg font-bold text-amber-700 tabular-nums">
                 {monthSummary.pending}건
               </p>
             </div>
@@ -382,6 +392,9 @@ export function WorkCalendarView({
 
                   const dayLogs = logsByDate.get(cell.dateStr) || [];
                   const totalCount = dayLogs.length;
+                  const urgentCount = dayLogs.filter(
+                    (l) => l.status === 'urgent'
+                  ).length;
                   const completedCount = dayLogs.filter(
                     (l) => (l.status || 'completed') === 'completed'
                   ).length;
@@ -453,6 +466,14 @@ export function WorkCalendarView({
                             }`}
                             aria-hidden="true"
                           >
+                            {urgentCount > 0 && (
+                              <div
+                                className="bg-rose-500 h-full"
+                                style={{
+                                  width: `${(urgentCount / totalCount) * 100}%`,
+                                }}
+                              />
+                            )}
                             {completedCount > 0 && (
                               <div
                                 className="bg-emerald-500 h-full"
@@ -490,6 +511,10 @@ export function WorkCalendarView({
             <div className="mt-4 pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
               <span>날짜를 터치하면 해당 날짜의 작업 목록이 표시됩니다.</span>
               <div className="flex items-center gap-3 font-medium">
+                <span className="inline-flex items-center gap-1 text-rose-700">
+                  <span className="w-2.5 h-1.5 rounded-sm bg-rose-500" aria-hidden="true" />
+                  긴급
+                </span>
                 <span className="inline-flex items-center gap-1 text-emerald-700">
                   <span className="w-2.5 h-1.5 rounded-sm bg-emerald-500" aria-hidden="true" />
                   완료
@@ -525,6 +550,14 @@ export function WorkCalendarView({
                 작업 {selectedDayLogs.length}건
                 {selectedDayLogs.length > 0 && (
                   <>
+                    {selectedDaySummary.urgent > 0 && (
+                      <>
+                        <span aria-hidden="true"> · </span>
+                        <span className="text-rose-700 font-bold">
+                          긴급 {selectedDaySummary.urgent}
+                        </span>
+                      </>
+                    )}
                     <span aria-hidden="true"> · </span>
                     <span className="text-emerald-700 font-medium">
                       완료 {selectedDaySummary.completed}
