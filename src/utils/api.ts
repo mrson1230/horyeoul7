@@ -79,11 +79,39 @@ export async function apiFetch<T>(
     let message = `요청 처리 중 오류가 발생했습니다. (HTTP ${res.status})`;
     if (contentType.includes('application/json')) {
       try {
-        const data = (await res.json()) as { error?: string };
-        if (data.error) message = data.error;
+        const data = (await res.json()) as {
+          error?: string;
+          code?: string;
+        };
+        console.error('[apiFetch] JSON Error Response:', {
+          method: options.method || 'GET',
+          url,
+          status: res.status,
+          code: data.code,
+          error: data.error,
+        });
+        if (data.error) {
+          message = data.code ? `${data.error} [${data.code}]` : data.error;
+        }
       } catch {
-        // Use fallback message
+        console.error('[apiFetch] Failed to parse error JSON:', {
+          method: options.method || 'GET',
+          url,
+          status: res.status,
+        });
       }
+    } else {
+      const rawSnippet = await res
+        .text()
+        .then((txt) => txt.slice(0, 200))
+        .catch(() => '');
+      console.error('[apiFetch] Non-JSON Error Response:', {
+        method: options.method || 'GET',
+        url,
+        status: res.status,
+        contentType,
+        bodySnippet: rawSnippet,
+      });
     }
     throw new Error(message);
   }
@@ -92,6 +120,12 @@ export async function apiFetch<T>(
     return (await res.json()) as T;
   }
   if (contentType.includes('text/html')) {
+    console.error('[apiFetch] Unexpected HTML response for API endpoint:', {
+      method: options.method || 'GET',
+      url,
+      status: res.status,
+      contentType,
+    });
     throw new Error(
       'API 서버 응답을 받지 못했습니다. 배포 환경의 API 경로 설정을 확인해 주세요.'
     );

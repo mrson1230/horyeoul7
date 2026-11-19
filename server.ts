@@ -27,12 +27,37 @@ const PG_CONFIG_INVALID =
   PG_CONNECTION_STRING.length > 0 && !HAS_VALID_PG_URL;
 const USE_POSTGRES = HAS_VALID_PG_URL;
 
-const SESSION_SECRET = (
-  process.env.SESSION_SECRET ||
+const RAW_SESSION_SECRET = (process.env.SESSION_SECRET || '').trim();
+const SESSION_SECRET_SOURCE: 'env' | 'derived-db' | 'default-fallback' =
+  RAW_SESSION_SECRET
+    ? 'env'
+    : USE_POSTGRES
+      ? 'derived-db'
+      : 'default-fallback';
+const SESSION_SECRET =
+  RAW_SESSION_SECRET ||
   (USE_POSTGRES
     ? crypto.createHash('sha256').update(PG_CONNECTION_STRING).digest('hex')
-    : 'apt-worklog-stateless-session-secret-v1')
-).trim();
+    : 'apt-worklog-stateless-session-secret-v1');
+
+function getEnvDiagnostics() {
+  return {
+    runtime: IS_VERCEL ? 'vercel' : 'node',
+    vercelEnv: process.env.VERCEL_ENV || null,
+    nodeEnv: process.env.NODE_ENV || null,
+    hasDatabaseUrl: PG_CONNECTION_STRING.length > 0,
+    databaseUrlValid: HAS_VALID_PG_URL,
+    pgConfigInvalid: PG_CONFIG_INVALID,
+    hasSessionSecret: RAW_SESSION_SECRET.length > 0,
+    sessionSecretSource: SESSION_SECRET_SOURCE,
+    hasCustomCompanyPassword:
+      (process.env.COMPANY_SHARED_PASSWORD || '').trim().length > 0,
+    hasCustomAdminPassword:
+      (process.env.ADMIN_PASSWORD || '').trim().length > 0,
+    hasCustomMasterPassword:
+      (process.env.MASTER_ADMIN_PASSWORD || '').trim().length > 0,
+  };
+}
 
 const DATA_DIR = IS_VERCEL
   ? path.join(os.tmpdir(), 'apt-worklog-data')
@@ -271,8 +296,10 @@ function createInitialStore(): StoreData {
         name: '호려울마을 7단지',
         officeName: '호려울마을 7단지 관리사무소',
         companyId: 'horyeoul7',
-        companyPassword: process.env.COMPANY_SHARED_PASSWORD || '7777',
-        adminPassword: process.env.ADMIN_PASSWORD || 'admin7777',
+        companyPassword:
+          (process.env.COMPANY_SHARED_PASSWORD || '').trim() || '7777',
+        adminPassword:
+          (process.env.ADMIN_PASSWORD || '').trim() || 'admin7777',
         createdAt: nowIso,
       },
     ],
@@ -633,11 +660,11 @@ function readStore(): StoreData {
           companyId: parsed.settings?.companyId || 'horyeoul7',
           companyPassword:
             parsed.settings?.companyPassword ||
-            process.env.COMPANY_SHARED_PASSWORD ||
+            (process.env.COMPANY_SHARED_PASSWORD || '').trim() ||
             '7777',
           adminPassword:
             parsed.settings?.adminPassword ||
-            process.env.ADMIN_PASSWORD ||
+            (process.env.ADMIN_PASSWORD || '').trim() ||
             'admin7777',
           createdAt: new Date().toISOString(),
         },
@@ -918,10 +945,23 @@ function createSignedToken(
 }
 
 function verifySignedToken(token: string): SessionRecord | null {
+  const tokenPrefix = token ? `${token.slice(0, 10)}...` : 'empty';
   const parts = token.split('.');
-  if (parts.length !== 2) return null;
+  if (parts.length !== 2) {
+    console.warn('[Auth] Token verification failed: malformed format', {
+      tokenPrefix,
+      secretSource: SESSION_SECRET_SOURCE,
+    });
+    return null;
+  }
   const [encoded, sig] = parts;
-  if (!encoded || !sig) return null;
+  if (!encoded || !sig) {
+    console.warn('[Auth] Token verification failed: missing segment', {
+      tokenPrefix,
+      secretSource: SESSION_SECRET_SOURCE,
+    });
+    return null;
+  }
 
   const expectedSig = crypto
     .createHmac('sha256', SESSION_SECRET)
@@ -933,6 +973,14 @@ function verifySignedToken(token: string): SessionRecord | null {
     sigBuf.length !== expectedBuf.length ||
     !crypto.timingSafeEqual(sigBuf, expectedBuf)
   ) {
+    console.warn(
+      '[Auth] Token verification failed: HMAC signature mismatch (check SESSION_SECRET consistency)',
+      {
+        tokenPrefix,
+        secretSource: SESSION_SECRET_SOURCE,
+        hasSessionSecretEnv: RAW_SESSION_SECRET.length > 0,
+      }
+    );
     return null;
   }
 
@@ -945,9 +993,20 @@ function verifySignedToken(token: string): SessionRecord | null {
       mst?: boolean;
       iat?: number;
     };
-    if (!parsed.apt || typeof parsed.iat !== 'number') return null;
+    if (!parsed.apt || typeof parsed.iat !== 'number') {
+      console.warn('[Auth] Token verification failed: invalid payload', {
+        tokenPrefix,
+      });
+      return null;
+    }
     const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
-    if (Date.now() - parsed.iat > maxAgeMs) return null;
+    if (Date.now() - parsed.iat > maxAgeMs) {
+      console.warn('[Auth] Token verification failed: token expired', {
+        tokenPrefix,
+        apt: parsed.apt,
+      });
+      return null;
+    }
     const createdIso = new Date(parsed.iat).toISOString();
     return {
       token,
@@ -957,7 +1016,11 @@ function verifySignedToken(token: string): SessionRecord | null {
       createdAt: createdIso,
       lastSeenAt: new Date().toISOString(),
     };
-  } catch {
+  } catch (err) {
+    console.warn('[Auth] Token verification failed: JSON decode error', {
+      tokenPrefix,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -1031,21 +1094,27 @@ function asyncHandler(fn: AsyncRouteHandler) {
 
 async function findSessionByToken(token: string): Promise<SessionRecord | null> {
   if (USE_POSTGRES) {
-    await ensurePgReady();
-    const res = await getPgPool().query(
-      'SELECT token, apartment_id, is_admin, is_master, created_at, last_seen_at FROM sessions WHERE token = $1',
-      [token]
-    );
-    const row = res.rows[0];
-    if (row) {
-      return {
-        token: String(row.token),
-        apartmentId: String(row.apartment_id),
-        isAdmin: Boolean(row.is_admin),
-        isMaster: Boolean(row.is_master),
-        createdAt: String(row.created_at),
-        lastSeenAt: String(row.last_seen_at),
-      };
+    try {
+      await ensurePgReady();
+      const res = await getPgPool().query(
+        'SELECT token, apartment_id, is_admin, is_master, created_at, last_seen_at FROM sessions WHERE token = $1',
+        [token]
+      );
+      const row = res.rows[0];
+      if (row) {
+        return {
+          token: String(row.token),
+          apartmentId: String(row.apartment_id),
+          isAdmin: Boolean(row.is_admin),
+          isMaster: Boolean(row.is_master),
+          createdAt: String(row.created_at),
+          lastSeenAt: String(row.last_seen_at),
+        };
+      }
+    } catch (err) {
+      console.error('[Auth] Session DB lookup failed, falling back to signed token verification:', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
     return verifySignedToken(token);
   }
@@ -1057,11 +1126,20 @@ const requireAuth = asyncHandler(
   async (req: AuthedRequest, res: Response, next: NextFunction) => {
     const token = extractToken(req);
     if (!token) {
+      console.warn('[Auth] Missing bearer token on protected route:', {
+        method: req.method,
+        path: req.originalUrl || req.url,
+      });
       res.status(401).json({ error: '로그인이 필요합니다.' });
       return;
     }
     const session = await findSessionByToken(token);
     if (!session) {
+      console.warn('[Auth] Invalid or expired session token:', {
+        method: req.method,
+        path: req.originalUrl || req.url,
+        secretSource: SESSION_SECRET_SOURCE,
+      });
       res.status(401).json({ error: '세션이 만료되었습니다. 다시 로그인해 주세요.' });
       return;
     }
@@ -1136,6 +1214,12 @@ function filterAndSortLogs(
 
 export function createApp(): express.Express {
   ensureStorage();
+  const envDiagnostics = getEnvDiagnostics();
+  console.info('[Server Init] Runtime & auth environment:', {
+    ...envDiagnostics,
+    storage: USE_POSTGRES ? 'postgres' : IS_VERCEL ? 'memory' : 'file',
+  });
+
   const app = express();
   const jsonParser = express.json({ limit: '10mb' });
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -1151,6 +1235,28 @@ export function createApp(): express.Express {
     jsonParser(req, res, next);
   });
 
+  app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    const startedAt = Date.now();
+    res.on('finish', () => {
+      const durationMs = Date.now() - startedAt;
+      const logPayload = {
+        method: req.method,
+        path: req.originalUrl || req.url,
+        status: res.statusCode,
+        durationMs,
+        storage: USE_POSTGRES ? 'postgres' : IS_VERCEL ? 'memory' : 'file',
+      };
+      if (res.statusCode >= 500) {
+        console.error('[API Response 5xx]', logPayload);
+      } else if (res.statusCode >= 400) {
+        console.warn('[API Response 4xx]', logPayload);
+      } else {
+        console.info('[API Response]', logPayload);
+      }
+    });
+    next();
+  });
+
   app.get('/api/uploads/:filename', (req: Request, res: Response) => {
     const safeName = path.basename(req.params.filename);
     const fullPath = path.join(UPLOADS_DIR, safeName);
@@ -1164,15 +1270,34 @@ export function createApp(): express.Express {
   app.get(
     '/api/health',
     asyncHandler(async (_req: Request, res: Response) => {
+      const env = getEnvDiagnostics();
       if (USE_POSTGRES) {
-        await ensurePgReady();
-        await getPgPool().query('SELECT 1');
-        res.json({ ok: true, storage: 'postgres' });
-        return;
+        try {
+          await ensurePgReady();
+          await getPgPool().query('SELECT 1');
+          res.json({ ok: true, storage: 'postgres', env });
+          return;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err || '');
+          const code =
+            err && typeof err === 'object' && 'code' in err
+              ? String((err as { code?: unknown }).code || '')
+              : undefined;
+          console.error('[Health] PostgreSQL check failed:', { code, msg });
+          res.status(503).json({
+            ok: false,
+            storage: 'postgres',
+            env,
+            dbError: code || 'PG_ERROR',
+            error: '클라우드 DB 연결 상태를 확인해 주세요.',
+          });
+          return;
+        }
       }
       res.json({
         ok: true,
         storage: IS_VERCEL ? 'memory' : 'file',
+        env,
         ...(PG_CONFIG_INVALID
           ? {
               pgConfigWarning:
@@ -1479,13 +1604,15 @@ export function createApp(): express.Express {
           'SELECT * FROM apartments ORDER BY created_at ASC'
         );
         const apartments = aptsRes.rows.map(mapApartmentRow);
-        const defaultApt = apartments[0];
+        const fallbackApt = createInitialStore().apartments[0];
+        const defaultApt = apartments[0] || fallbackApt;
         const session = token ? await findSessionByToken(token) : null;
 
         if (!session) {
           res.json({
             authenticated: false,
             isAdmin: false,
+            isMaster: false,
             companyId: defaultApt.companyId,
             apartmentId: defaultApt.id,
             apartmentName: defaultApt.name,
@@ -1509,7 +1636,8 @@ export function createApp(): express.Express {
       }
 
       const store = readStore();
-      const defaultApt = store.apartments[0];
+      const defaultApt =
+        store.apartments[0] || createInitialStore().apartments[0];
       const session = token ? await findSessionByToken(token) : null;
 
       if (!session) {
@@ -1544,7 +1672,7 @@ export function createApp(): express.Express {
   app.post(
     '/api/auth/login',
     asyncHandler(async (req: Request, res: Response) => {
-      const { companyId, password, apartmentId } = req.body as {
+      const { companyId, password, apartmentId } = (req.body || {}) as {
         companyId?: string;
         password?: string;
         apartmentId?: string;
@@ -1579,6 +1707,12 @@ export function createApp(): express.Express {
             trimmedPassword === apt!.companyPassword.trim());
 
         if (!apt || apt.companyId.toLowerCase() !== trimmedId || !passwordMatches) {
+          console.warn('[Auth] Shared login rejected (postgres):', {
+            companyId: trimmedId || '(empty)',
+            apartmentId: apartmentId || null,
+            apartmentFound: Boolean(apt),
+            passwordEmpty: !trimmedPassword,
+          });
           res.status(401).json({
             error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
           });
@@ -1587,17 +1721,25 @@ export function createApp(): express.Express {
 
         const token = createSignedToken(apt.id, false, false);
         const nowIso = new Date().toISOString();
-        await pool.query(
-          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [token, apt.id, false, false, nowIso, nowIso]
-        );
-        await pool.query(`
-          DELETE FROM sessions
-          WHERE token IN (
-            SELECT token FROM sessions ORDER BY last_seen_at DESC OFFSET 150
-          )
-        `);
+        try {
+          await pool.query(
+            `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (token) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`,
+            [token, apt.id, false, false, nowIso, nowIso]
+          );
+          await pool.query(`
+            DELETE FROM sessions
+            WHERE token IN (
+              SELECT token FROM sessions ORDER BY last_seen_at DESC OFFSET 150
+            )
+          `);
+        } catch (sessionErr) {
+          console.warn(
+            '[Auth] Session persistence warning (continuing with stateless token):',
+            sessionErr instanceof Error ? sessionErr.message : String(sessionErr)
+          );
+        }
 
         res.json({
           token,
@@ -1629,12 +1771,18 @@ export function createApp(): express.Express {
         (rawPassword === apt!.companyPassword ||
           trimmedPassword === apt!.companyPassword.trim());
 
-      if (!apt || apt.companyId.toLowerCase() !== trimmedId || !passwordMatches) {
-        res.status(401).json({
-          error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
-        });
-        return;
-      }
+        if (!apt || apt.companyId.toLowerCase() !== trimmedId || !passwordMatches) {
+          console.warn('[Auth] Shared login rejected (local/memory):', {
+            companyId: trimmedId || '(empty)',
+            apartmentId: apartmentId || null,
+            apartmentFound: Boolean(apt),
+            passwordEmpty: !trimmedPassword,
+          });
+          res.status(401).json({
+            error: '회사 공통 아이디 또는 비밀번호가 일치하지 않습니다.',
+          });
+          return;
+        }
 
       const token = createSignedToken(apt.id, false, false);
       const nowIso = new Date().toISOString();
@@ -1700,7 +1848,7 @@ export function createApp(): express.Express {
     '/api/auth/admin/unlock',
     requireAuth,
     asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const { adminPassword } = req.body as { adminPassword?: string };
+      const { adminPassword } = (req.body || {}) as { adminPassword?: string };
       const apartmentId = req.session!.apartmentId;
       const oldToken = req.session!.token;
       const isMaster = Boolean(req.session!.isMaster);
@@ -1721,17 +1869,30 @@ export function createApp(): express.Express {
           !trimmedPw ||
           (rawPw !== expectedPw && trimmedPw !== expectedPw.trim())
         ) {
+          console.warn('[Auth] Admin unlock rejected (postgres):', {
+            apartmentId,
+            apartmentFound: Boolean(aptRow),
+            passwordEmpty: !trimmedPw,
+          });
           res.status(401).json({ error: '관리자 비밀번호가 올바르지 않습니다.' });
           return;
         }
         const nextToken = createSignedToken(apartmentId, true, isMaster);
         const nowIso = new Date().toISOString();
-        await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
-        await pool.query(
-          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [nextToken, apartmentId, true, isMaster, nowIso, nowIso]
-        );
+        try {
+          await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
+          await pool.query(
+            `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (token) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`,
+            [nextToken, apartmentId, true, isMaster, nowIso, nowIso]
+          );
+        } catch (sessionErr) {
+          console.warn(
+            '[Auth] Admin session persistence warning (continuing with stateless token):',
+            sessionErr instanceof Error ? sessionErr.message : String(sessionErr)
+          );
+        }
         res.json({ isAdmin: true, isMaster, token: nextToken });
         return;
       }
@@ -1743,6 +1904,11 @@ export function createApp(): express.Express {
         !trimmedPw ||
         (rawPw !== apt.adminPassword && trimmedPw !== apt.adminPassword.trim())
       ) {
+        console.warn('[Auth] Admin unlock rejected (local/memory):', {
+          apartmentId,
+          apartmentFound: Boolean(apt),
+          passwordEmpty: !trimmedPw,
+        });
         res.status(401).json({ error: '관리자 비밀번호가 올바르지 않습니다.' });
         return;
       }
@@ -1775,12 +1941,20 @@ export function createApp(): express.Express {
       if (USE_POSTGRES) {
         await ensurePgReady();
         const pool = getPgPool();
-        await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
-        await pool.query(
-          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [nextToken, apartmentId, false, isMaster, nowIso, nowIso]
-        );
+        try {
+          await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
+          await pool.query(
+            `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (token) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`,
+            [nextToken, apartmentId, false, isMaster, nowIso, nowIso]
+          );
+        } catch (sessionErr) {
+          console.warn(
+            '[Auth] Admin lock session persistence warning:',
+            sessionErr instanceof Error ? sessionErr.message : String(sessionErr)
+          );
+        }
         res.json({ isAdmin: false, isMaster, token: nextToken });
         return;
       }
@@ -1805,10 +1979,9 @@ export function createApp(): express.Express {
     requireAuth,
     requireAdmin,
     asyncHandler(async (req: AuthedRequest, res: Response) => {
-      const { masterPassword } = req.body as { masterPassword?: string };
-      const expectedMaster = (
-        process.env.MASTER_ADMIN_PASSWORD || 'master7777'
-      ).trim();
+      const { masterPassword } = (req.body || {}) as { masterPassword?: string };
+      const expectedMaster =
+        (process.env.MASTER_ADMIN_PASSWORD || '').trim() || 'master7777';
       const rawPw = masterPassword || '';
       const trimmedPw = rawPw.trim();
 
@@ -1816,6 +1989,12 @@ export function createApp(): express.Express {
         !trimmedPw ||
         (rawPw !== expectedMaster && trimmedPw !== expectedMaster)
       ) {
+        console.warn('[Auth] Master unlock rejected:', {
+          apartmentId: req.session!.apartmentId,
+          passwordEmpty: !trimmedPw,
+          hasCustomMasterPassword:
+            (process.env.MASTER_ADMIN_PASSWORD || '').trim().length > 0,
+        });
         res
           .status(401)
           .json({ error: '통합 광고 마스터 비밀번호가 올바르지 않습니다.' });
@@ -1830,12 +2009,20 @@ export function createApp(): express.Express {
       if (USE_POSTGRES) {
         await ensurePgReady();
         const pool = getPgPool();
-        await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
-        await pool.query(
-          `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [nextToken, apartmentId, true, true, nowIso, nowIso]
-        );
+        try {
+          await pool.query('DELETE FROM sessions WHERE token = $1', [oldToken]);
+          await pool.query(
+            `INSERT INTO sessions (token, apartment_id, is_admin, is_master, created_at, last_seen_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (token) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`,
+            [nextToken, apartmentId, true, true, nowIso, nowIso]
+          );
+        } catch (sessionErr) {
+          console.warn(
+            '[Auth] Master session persistence warning:',
+            sessionErr instanceof Error ? sessionErr.message : String(sessionErr)
+          );
+        }
       } else {
         const store = readStore();
         delete store.sessions[oldToken];
@@ -3698,29 +3885,50 @@ export function createApp(): express.Express {
 
   // Ensure unmatched /api/* routes always return JSON (never Express HTML 404)
   app.use('/api', (req: Request, res: Response) => {
+    console.warn('[API 404]', {
+      method: req.method,
+      url: req.originalUrl || req.url,
+    });
     res.status(404).json({
+      code: 'API_NOT_FOUND',
       error: `요청하신 API 경로를 찾을 수 없습니다. (${req.method} ${req.originalUrl || req.url})`,
     });
   });
 
   // Express JSON error boundary
   app.use(
-    (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-      console.error('API Error:', err);
+    (err: unknown, req: Request, res: Response, _next: NextFunction) => {
       const message = err instanceof Error ? err.message : String(err || '');
+      const pgCode =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : undefined;
+      console.error('[API Error Boundary]', {
+        method: req.method,
+        path: req.originalUrl || req.url,
+        storage: USE_POSTGRES ? 'postgres' : IS_VERCEL ? 'memory' : 'file',
+        secretSource: SESSION_SECRET_SOURCE,
+        pgCode,
+        message,
+        stack: err instanceof Error ? err.stack?.split('\n').slice(0, 4).join(' | ') : undefined,
+      });
+
       if (
         USE_POSTGRES &&
-        /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|password authentication failed|database .* does not exist|no pg_hba\.conf|SSL|certificate|connection terminated/i.test(
-          message
+        /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|getaddrinfo|password authentication failed|SASL|SCRAM|database .* does not exist|no pg_hba\.conf|SSL|certificate|connection terminated|timeout exceeded|Tenant or user not found|max clients/i.test(
+          `${pgCode || ''} ${message}`
         )
       ) {
         res.status(503).json({
+          code: 'DB_CONNECTION_ERROR',
           error:
             '클라우드 DB 연결에 실패했습니다. Vercel 환경 변수(DATABASE_URL) 주소를 확인한 뒤 다시 배포해 주세요.',
         });
         return;
       }
+
       res.status(500).json({
+        code: pgCode || 'INTERNAL_SERVER_ERROR',
         error: '서버 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
       });
     }
